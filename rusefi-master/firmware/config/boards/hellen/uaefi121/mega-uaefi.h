@@ -1,2 +1,0 @@
-void setMegaUaefiBoardDefaultConfiguration();
-void setMegaUaefiBoardConfigOverrides();

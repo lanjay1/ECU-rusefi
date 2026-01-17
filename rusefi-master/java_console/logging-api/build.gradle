@@ -1,9 +1,0 @@
-plugins {
-    id 'java'
-}
-
-apply from: dependenciesPath
-
-dependencies {
-    implementation global_libs.jsr305
-}

@@ -1,1 +1,0 @@
-still not a full engineModule since we dont need this loaded all the time, used to check configs from the fw side, see [#8666](https://github.com/rusefi/rusefi/issues/8666)

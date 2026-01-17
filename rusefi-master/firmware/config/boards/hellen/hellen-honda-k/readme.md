@@ -1,1 +1,0 @@
-https://wiki.rusefi.com/Hellen-Honda-K

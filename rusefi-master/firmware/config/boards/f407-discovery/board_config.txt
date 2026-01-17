@@ -1,2 +1,0 @@
-Gpio communityCommsLedPin
-int technicalDebt7738

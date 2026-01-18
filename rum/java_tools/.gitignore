@@ -1,0 +1,10 @@
+current_configuration.zip
+current_configuration.msq
+downloaded_tunes
+**/rusefi_tool.log
+log
+# PTrace files
+*.json
+triggers
+
+PCAN*.dll

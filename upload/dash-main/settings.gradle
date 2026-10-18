@@ -1,0 +1,22 @@
+pluginManagement {
+    repositories {
+        maven { url 'https://dl.google.com/dl/android/maven2/' }
+        maven { url 'https://maven.google.com/' }
+        gradlePluginPortal()
+        mavenCentral()
+    }
+}
+
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositories {
+        google()
+        mavenCentral()
+        // JitPack — required for com.github.mik3y:usb-serial-for-android
+        // (USB serial library used by UsbSerialTransport.kt)
+        maven { url 'https://jitpack.io' }
+    }
+}
+
+rootProject.name = "ztune-repo"
+include ':app'

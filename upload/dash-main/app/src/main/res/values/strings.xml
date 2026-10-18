@@ -1,0 +1,154 @@
+<resources>
+    <string name="app_name">ZTUNE</string>
+
+    <!-- Navigation labels -->
+    <string name="nav_home">Home</string>
+    <string name="nav_dashboard">Dashboard</string>
+    <string name="nav_tune_editor">Tune</string>
+    <string name="nav_datalog">Datalog</string>
+    <string name="nav_settings">Settings</string>
+    <string name="nav_calibration">Calibration</string>
+    <string name="nav_tools">Tools</string>
+
+    <!-- Connection -->
+    <string name="conn_title">ECU Connection</string>
+    <string name="conn_status_disconnected">Disconnected</string>
+    <string name="conn_status_connecting">Connecting…</string>
+    <string name="conn_status_connected">Connected</string>
+    <string name="conn_status_error">Error</string>
+    <string name="conn_status_reconnecting">Reconnecting…</string>
+    <string name="conn_disconnect">Disconnect</string>
+    <string name="conn_no_devices">No USB serial devices detected. Connect an ECU via USB-OTG and try again.</string>
+    <string name="conn_demo_button">Connect Demo ECU</string>
+    <string name="conn_devices_section">USB Devices</string>
+    <string name="conn_mode_usb">USB OTG</string>
+    <string name="conn_mode_wifi">WiFi</string>
+    <string name="conn_wifi_section">WiFi Connection (TCP)</string>
+    <string name="conn_wifi_host">IP Address / Hostname</string>
+    <string name="conn_wifi_port">Port</string>
+    <string name="conn_wifi_connect">Connect via WiFi</string>
+    <string name="conn_dialog_title">Connect to ECU</string>
+    <string name="conn_dialog_status_connected">Connected to ECU</string>
+    <string name="conn_dialog_status_disconnected">Not connected</string>
+    <string name="conn_dialog_via_usb">USB OTG (Cable)</string>
+    <string name="conn_dialog_via_usb_desc">Connect over a USB-OTG cable</string>
+    <string name="conn_dialog_via_wifi">WiFi (TCP)</string>
+    <string name="conn_dialog_via_wifi_desc">Connect over WiFi using IP and port</string>
+    <string name="conn_dialog_close">Close</string>
+
+    <!-- Home -->
+    <string name="home_title">ZTUNE</string>
+    <string name="home_subtitle">Open-source ECU tuning for Android.</string>
+    <string name="home_connection_title">ECU Status</string>
+    <string name="home_not_connected">Not connected — connect an ECU via USB-OTG or use demo mode.</string>
+    <string name="home_connected">Connected: %1$s</string>
+    <string name="home_action_connect">Connect ECU</string>
+    <string name="home_action_dashboard">Open Dashboard</string>
+    <string name="home_action_tune">Open Tune Editor</string>
+
+    <!-- Dashboard -->
+    <string name="dash_title">Dashboard</string>
+    <string name="dash_subtitle">Real-time gauges from ECU output channels.</string>
+    <string name="dash_start_stream">Start Streaming</string>
+    <string name="dash_stop_stream">Stop Streaming</string>
+    <string name="dash_not_connected">Not connected to ECU</string>
+    <string name="dash_connect_hint">Connect an ECU via USB-OTG or use demo mode, then return here.</string>
+
+    <!-- Tune Editor -->
+    <string name="tune_title">Tune Editor</string>
+    <string name="tune_subtitle">Edit VE, ignition, and other tables.</string>
+    <string name="tune_not_connected">Not connected to ECU — editor needs page data.</string>
+    <string name="tune_demo_subtitle">Showing demo tables — ECU not connected.</string>
+    <string name="tune_connect_hint">Connect an ECU or use Demo mode, then return.</string>
+    <string name="tune_load_page">Load Page from ECU</string>
+
+    <!-- Datalog -->
+    <string name="dl_title">Datalog</string>
+    <string name="dl_subtitle">Record ECU data and export CSV logs.</string>
+    <string name="dl_start">Start Recording</string>
+    <string name="dl_stop">Stop &amp; Save</string>
+    <string name="dl_not_connected">ECU connection required for recording.</string>
+
+    <!-- Calibration -->
+    <string name="cal_title">Sensor Calibration</string>
+    <string name="cal_tps">TPS Calibration</string>
+    <string name="cal_afr">AFR Calibration</string>
+    <string name="cal_clt">CLT Calibration</string>
+    <string name="cal_iat">IAT Calibration</string>
+    <string name="cal_map">MAP Calibration</string>
+    <string name="cal_baro">Baro Calibration</string>
+
+    <!-- AutoTune -->
+    <string name="at_title">AutoTune</string>
+    <string name="at_start">Start AutoTune</string>
+    <string name="at_stop">Stop</string>
+    <string name="at_send">Send Recommendations</string>
+    <string name="at_settings">Settings</string>
+
+    <!-- Lua Console -->
+    <string name="lua_title">Lua Console</string>
+    <string name="lua_execute">Execute</string>
+    <string name="lua_clear">Clear</string>
+
+    <!-- Tune History -->
+    <string name="th_title">Tune History</string>
+    <string name="th_restore">Restore</string>
+    <string name="th_prune">Prune Old</string>
+    <string name="th_diff">View Changes</string>
+
+    <!-- VE Analysis -->
+    <string name="va_title">VE Analysis</string>
+    <string name="va_run">Run Analysis</string>
+    <string name="va_apply">Apply to Table</string>
+
+    <!-- Diagnostics -->
+    <string name="diag_tooth_logger">Tooth Logger</string>
+    <string name="diag_console">ECU Console</string>
+
+    <!-- Curve Editor -->
+    <string name="ce_title">Curve Editor</string>
+    <string name="ce_smooth">Smooth</string>
+    <string name="ce_interpolate">Interpolate</string>
+
+    <!-- Tools -->
+    <string name="tools_lua">Lua Console</string>
+    <string name="tools_history">Tune History</string>
+    <string name="tools_analysis">VE Analysis</string>
+    <string name="tools_tooth">Tooth Logger</string>
+    <string name="tools_console">ECU Console</string>
+
+    <!-- Settings -->
+    <string name="settings_title">Settings</string>
+    <string name="settings_appearance">Appearance</string>
+    <string name="settings_theme">Theme</string>
+    <string name="theme_system">Follow system</string>
+    <string name="theme_light">Light</string>
+    <string name="theme_dark">Dark</string>
+    <string name="settings_usb_section">USB Connection</string>
+    <string name="settings_usb_baud">Baud rate</string>
+    <string name="settings_reconnect_section">Auto-reconnect</string>
+    <string name="settings_auto_reconnect">Auto-reconnect on disconnect</string>
+    <string name="settings_max_attempts">Max attempts</string>
+    <string name="settings_delay">Delay between attempts</string>
+    <string name="settings_delay_fmt">%1$d ms</string>
+    <string name="settings_units">Units</string>
+    <string name="settings_temperature">Temperature</string>
+    <string name="settings_pressure">Pressure</string>
+    <string name="settings_afr_lambda">Display as Lambda</string>
+    <string name="settings_transport">Transport</string>
+    <string name="settings_bluetooth">Bluetooth</string>
+    <string name="settings_tcp">TCP / WiFi</string>
+    <string name="settings_version">Version</string>
+
+    <!-- Dialog -->
+    <string name="dialog_save">Save</string>
+    <string name="dialog_cancel">Cancel</string>
+    <string name="dialog_ok">OK</string>
+    <string name="dialog_discard">Discard</string>
+    <string name="dialog_confirm_restore">Restore this tune snapshot? Current unsaved changes will be lost.</string>
+    <string name="dialog_prune_confirm">Delete old tune snapshots beyond the limit?</string>
+
+    <!-- Help -->
+    <string name="help_title">Help</string>
+    <string name="help_no_topic">No help topic available.</string>
+</resources>

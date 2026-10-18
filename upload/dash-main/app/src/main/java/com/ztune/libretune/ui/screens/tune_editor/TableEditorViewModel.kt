@@ -1,0 +1,746 @@
+package com.ztune.libretune.ui.screens.tune_editor
+
+import androidx.lifecycle.SavedStateHandle
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import com.ztune.libretune.core.EcuConnectionManager
+import com.ztune.libretune.core.EcuDefinitionRepository
+import com.ztune.libretune.core.TuneManager
+import com.ztune.libretune.core.ini.EcuDefinition
+import com.ztune.libretune.core.ini.types.TableDefinition
+import com.ztune.libretune.core.realtime.RealtimeChannelStore
+import com.ztune.libretune.core.tune.TableOperations
+import dagger.hilt.android.lifecycle.HiltViewModel
+import javax.inject.Inject
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+
+@HiltViewModel
+class TableEditorViewModel @Inject constructor(
+    savedStateHandle: SavedStateHandle,
+    private val tuneManager: TuneManager,
+    private val connectionManager: EcuConnectionManager,
+    private val channelStore: RealtimeChannelStore,
+    private val definitionRepository: EcuDefinitionRepository
+) : ViewModel() {
+
+    private val _uiState = MutableStateFlow(TableEditorUiState())
+    val uiState: StateFlow<TableEditorUiState> = _uiState
+
+    private val undoStack = ArrayDeque<List<List<Double>>>()
+    private val redoStack = ArrayDeque<List<List<Double>>>()
+    private val maxHistoryDepth = 100
+    private val lockedCells = mutableSetOf<Pair<Int, Int>>()
+
+    private var definition: EcuDefinition? = null
+    private var tableDef: TableDefinition? = null
+    private var xOutputChannel: String? = null
+    private var yOutputChannel: String? = null
+
+    private val tableName: String = savedStateHandle["name"] ?: ""
+
+    init {
+        if (tableName.isNotEmpty()) loadTable(tableName)
+        observeLiveCursors()
+        // Tune dibaca dari ECU di background tepat setelah konek. Kalau layar
+        // ini terbuka lebih dulu, muat ulang sekali saat tune sudah siap agar
+        // data asli menggantikan placeholder nol/demo.
+        viewModelScope.launch {
+            var waited = 0
+            while (tuneManager.currentTune == null && waited < 15_000) {
+                delay(250); waited += 250
+            }
+            if (tuneManager.currentTune != null && tableName.isNotEmpty()) {
+                loadTable(tableName)
+            }
+        }
+    }
+
+    /**
+     * v1.3.7 (audit finding #11) — SEBELUMNYA fungsi ini dipanggil sekali di
+     * [init], dan kalau saat itu `xOutputChannel`/`yOutputChannel` masih null
+     * (mis. load pertama jatuh ke [loadDemoTable] karena nama tabel belum
+     * ketemu di definition), baris `if (...) return` di atas membuat
+     * subscription live-cursor TIDAK PERNAH dipasang — walau tabel yang
+     * sebenarnya berhasil dimuat belakangan (lihat retry loop di [init])
+     * dan channel-nya sudah terisi, cursor tetap mati untuk SISA SESI itu,
+     * tanpa pesan error apapun.
+     *
+     * SEKARANG collect selalu dipasang; nama channel dicek ULANG di setiap
+     * emission (bukan sekali di awal) karena `xOutputChannel`/`yOutputChannel`
+     * adalah `var` yang bisa berubah setelah [loadFromDefinition] berjalan.
+     */
+    private fun observeLiveCursors() {
+        viewModelScope.launch {
+            channelStore.channels.collect { channels ->
+                val xCh = xOutputChannel
+                val yCh = yOutputChannel
+                if (xCh == null && yCh == null) return@collect
+                val xVal = xCh?.let { channels[it] }
+                val yVal = yCh?.let { channels[it] }
+                if (xVal != null || yVal != null) {
+                    _uiState.update {
+                        it.copy(liveXValue = xVal, liveYValue = yVal)
+                    }
+                    updateLiveCursor()
+                }
+            }
+        }
+    }
+
+    private fun updateLiveCursor() {
+        val st = _uiState.value
+        val xVal = st.liveXValue ?: return
+        val yVal = st.liveYValue ?: return
+        val xBins = st.xBins
+        val yBins = st.yBins
+        if (xBins.size < 2 || yBins.size < 2) return
+        var bestCol = 0
+        var minDistX = Double.MAX_VALUE
+        for (i in xBins.indices) {
+            val d = kotlin.math.abs(xBins[i] - xVal)
+            if (d < minDistX) { minDistX = d; bestCol = i }
+        }
+        var bestRow = 0
+        var minDistY = Double.MAX_VALUE
+        for (i in yBins.indices) {
+            val d = kotlin.math.abs(yBins[i] - yVal)
+            if (d < minDistY) { minDistY = d; bestRow = i }
+        }
+        _uiState.update { it.copy(liveCell = Pair(bestRow, bestCol)) }
+    }
+
+    fun loadTable(name: String) {
+        // 1) Prioritas: definisi ECU yang benar-benar tersambung live
+        val liveDef = connectionManager.activeDefinition
+        if (liveDef != null) {
+            loadFromDefinition(liveDef, name, isLive = true)
+            return
+        }
+
+        // 2) Belum konek — JANGAN pakai angka karangan (demo lama).
+        //    Ambil struktur tabel asli (rows/cols/xBins/yBins/units) langsung
+        //    dari ztune.ini yang dibundel di assets. Hanya isi CELL VALUE yang
+        //    placeholder 0.0, karena memang belum ada data live dari ECU.
+        val bundled = definitionRepository.loadDefinition("definitions/ztune/ztune.ini").getOrNull()
+        val tbl = bundled?.getTableByNameOrMap(name)
+        if (bundled != null && tbl != null && tbl.rows > 0 && tbl.cols > 0) {
+            loadFromDefinition(bundled, name, isLive = false)
+            return
+        }
+
+        // 3) Fallback terakhir kalau bahkan ztune.ini gagal di-parse/tabel tidak
+        //    ketemu sama sekali (harusnya tidak pernah kejadian untuk nama
+        //    tabel valid, tapi tetap dijaga supaya UI tidak kosong/crash).
+        loadDemoTable(name)
+    }
+
+    private fun loadFromDefinition(def: EcuDefinition, name: String, isLive: Boolean) {
+        val tbl = def.getTableByNameOrMap(name)
+        if (tbl == null || tbl.rows == 0 || tbl.cols == 0) {
+            loadDemoTable(name)
+            return
+        }
+
+        definition = def
+        tableDef = tbl
+        xOutputChannel = tbl.xAxis?.expression ?: "rpm"
+        yOutputChannel = tbl.yAxis?.expression ?: "map"
+
+        val tune = if (isLive) tuneManager.currentTune else null
+        val pageData = tune?.getPageData(tbl.page)
+        val decoder = com.ztune.libretune.core.realtime.RealtimeDecoder(def)
+
+        // Axis bins SELALU dari definisi ini (real, sampai 14000 utk VE/AFR/Spark)
+        // — baik lagi live maupun cuma preview dari ztune.ini bundled.
+        val xBins = if (pageData != null) decoder.decodeTableAxis(pageData, tbl.xAxis)
+                    else defaultAxisBins(tbl.xAxis, tbl.cols)
+        val yBins = if (pageData != null) decoder.decodeTableAxis(pageData, tbl.yAxis)
+                    else defaultAxisBins(tbl.yAxis, tbl.rows)
+
+        // Cell value: dari ECU kalau live, kalau belum konek ya 0.0 semua
+        // (bukan kurva sintetis palsu) — jujur bahwa ini belum data asli.
+        val values = if (pageData != null) decoder.decodeTable(pageData, tbl)
+                     else List(tbl.rows) { List(tbl.cols) { 0.0 } }
+
+        val flatValues = values.flatten()
+        val vMin = flatValues.minOrNull() ?: 0.0
+        val vMax = flatValues.maxOrNull() ?: 1.0
+        undoStack.clear(); redoStack.clear()
+        _uiState.update {
+            it.copy(
+                tableName = name,
+                title = tbl.name.ifEmpty { name },
+                rows = tbl.rows, cols = tbl.cols,
+                xBins = xBins, yBins = yBins, values = values,
+                units = tbl.units,
+                format = if (tbl.scale == 1.0 && tbl.translate == 0.0) "0" else "0.0",
+                min = vMin, max = if (vMax > vMin) vMax else vMin + 1.0,
+                selectedCell = null, isModified = false, canUndo = false, canRedo = false,
+                notConnected = !isLive
+            )
+        }
+    }
+
+    // Axis bin dari ini.ini kalau ada (mis. veRpmBins [800:14000]), kalau linked
+    // constant tidak punya nilai bawaan, generate merata di rentang deklarasinya
+    // alih-alih index polos 0,1,2,3...
+    private fun defaultAxisBins(axis: com.ztune.libretune.core.ini.types.TableAxis?, size: Int): List<Double> {
+        if (axis == null) return (0 until size).map { it.toDouble() }
+        val lo = axis.min
+        val hi = axis.max
+        if (hi <= lo || size <= 1) return (0 until size).map { lo + it }
+        return (0 until size).map { i -> lo + (hi - lo) * i / (size - 1) }
+    }
+
+    private fun loadDemoTable(name: String) {
+        val demo = demoTable(name)
+        undoStack.clear(); redoStack.clear()
+        _uiState.update {
+            it.copy(tableName = name, title = demo.title, rows = demo.rows, cols = demo.cols,
+                xBins = demo.xBins, yBins = demo.yBins, values = demo.values,
+                units = demo.units, format = demo.format, min = demo.min, max = demo.max,
+                selectedCell = null, isModified = false, canUndo = false, canRedo = false,
+                notConnected = true)
+        }
+    }
+
+    fun selectCell(row: Int, col: Int) { _uiState.update { it.copy(selectedCell = Pair(row, col), selectedCells = setOf(Pair(row, col))) } }
+    fun clearSelection() { _uiState.update { it.copy(selectedCell = null, selectedCells = emptySet()) } }
+
+    // ---- Multi-cell selection ----
+    fun selectCellRange(startRow: Int, startCol: Int, endRow: Int, endCol: Int) {
+        val r1 = minOf(startRow, endRow); val r2 = maxOf(startRow, endRow)
+        val c1 = minOf(startCol, endCol); val c2 = maxOf(startCol, endCol)
+        val cells = (r1..r2).flatMap { r -> (c1..c2).map { c -> Pair(r, c) } }.toSet()
+        _uiState.update { it.copy(selectedCell = Pair(r1, c1), selectedCells = cells) }
+    }
+
+    fun toggleCellInSelection(row: Int, col: Int) {
+        val cell = Pair(row, col)
+        val current = _uiState.value.selectedCells.toMutableSet()
+        if (cell in current) current.remove(cell) else current.add(cell)
+        _uiState.update { it.copy(selectedCell = cell, selectedCells = current) }
+    }
+
+    fun selectAll() {
+        val st = _uiState.value
+        val cells = (0 until st.rows).flatMap { r -> (0 until st.cols).map { c -> Pair(r, c) } }.toSet()
+        _uiState.update { it.copy(selectedCells = cells, selectedCell = Pair(0, 0)) }
+    }
+
+    // ---- Copy / Paste ----
+    private var clipboard: List<List<Double>>? = null
+
+    fun copySelection() {
+        val st = _uiState.value
+        if (st.selectedCells.isEmpty()) return
+        val rows = st.selectedCells.map { it.first }
+        val cols = st.selectedCells.map { it.second }
+        val minR = rows.min(); val maxR = rows.max()
+        val minC = cols.min(); val maxC = cols.max()
+        val data = (minR..maxR).map { r -> (minC..maxC).map { c ->
+            if (Pair(r, c) in st.selectedCells) st.values.getOrNull(r)?.getOrNull(c) ?: 0.0 else Double.NaN
+        }}
+        clipboard = data
+    }
+
+    // ------------------------------------------------------------------
+    // v1.3.7 (audit finding #17) — Konfirmasi buat edit tabel dalam jumlah
+    // besar. SEBELUMNYA tidak ada jaring pengaman sama sekali: satu salah
+    // drag-select atau salah tap tombol Scale/Equal/Smooth/Interpolate bisa
+    // langsung mengubah puluhan-ratusan cell tanpa peringatan — riskan di
+    // layar kecil HP. SEKARANG operasi yang menyentuh lebih dari
+    // [BULK_EDIT_CONFIRM_THRESHOLD] cell ditahan dulu sebagai
+    // [PendingBulkAction] dan menunggu [confirmPendingBulkAction] dari UI
+    // (dialog "Anda akan mengubah N cell, lanjutkan?"), bukan langsung jalan.
+    // ------------------------------------------------------------------
+
+    data class PendingBulkAction(
+        val description: String,
+        val cellCount: Int,
+        val action: () -> Unit
+    )
+
+    private fun requestOrRunBulk(description: String, affectedCellCount: Int, action: () -> Unit) {
+        if (affectedCellCount > BULK_EDIT_CONFIRM_THRESHOLD) {
+            _uiState.update { it.copy(pendingBulkAction = PendingBulkAction(description, affectedCellCount, action)) }
+        } else {
+            action()
+        }
+    }
+
+    fun confirmPendingBulkAction() {
+        _uiState.value.pendingBulkAction?.action?.invoke()
+        _uiState.update { it.copy(pendingBulkAction = null) }
+    }
+
+    fun cancelPendingBulkAction() {
+        _uiState.update { it.copy(pendingBulkAction = null) }
+    }
+
+    fun pasteToSelection() {
+        val clip = clipboard ?: return
+        val st = _uiState.value
+        val target = st.selectedCell ?: return
+        val cellCount = clip.sumOf { row -> row.count { !it.isNaN() } }
+        requestOrRunBulk("Paste ke $cellCount cell", cellCount) {
+            pushUndo()
+            val mutable = toMutableValues()
+            for ((dr, row) in clip.withIndex()) {
+                for ((dc, value) in row.withIndex()) {
+                    if (value.isNaN()) continue
+                    val r = target.first + dr; val c = target.second + dc
+                    if (r in mutable.indices && c in mutable[r].indices) {
+                        mutable[r][c] = value
+                    }
+                }
+            }
+            applyValues(mutable)
+        }
+    }
+
+    // ---- Add offset to selection ----
+    fun addOffsetToSelection(offset: Double) {
+        val st = _uiState.value
+        if (st.selectedCells.isEmpty()) return
+        requestOrRunBulk("Tambah offset $offset ke ${st.selectedCells.size} cell", st.selectedCells.size) {
+            pushUndo()
+            val mutable = toMutableValues()
+            for ((r, c) in st.selectedCells) {
+                if (r in mutable.indices && c in mutable[r].indices) {
+                    mutable[r][c] = mutable[r][c] + offset
+                }
+            }
+            applyValues(mutable)
+        }
+    }
+
+    // ---- Fill selection with value ----
+    fun fillSelection(value: Double) {
+        val st = _uiState.value
+        if (st.selectedCells.isEmpty()) return
+        requestOrRunBulk("Isi ${st.selectedCells.size} cell dengan $value", st.selectedCells.size) {
+            pushUndo()
+            val mutable = toMutableValues()
+            for ((r, c) in st.selectedCells) {
+                if (r in mutable.indices && c in mutable[r].indices) {
+                    mutable[r][c] = value
+                }
+            }
+            applyValues(mutable)
+        }
+    }
+
+    fun setCellValue(row: Int, col: Int, value: Double) {
+        val current = _uiState.value
+        if (row !in 0 until current.rows || col !in 0 until current.cols) return
+        if (Pair(row, col) in lockedCells) return
+        if (current.values[row][col] == value) return
+        pushUndo()
+        val newValues = current.values.mapIndexed { r, rowList ->
+            if (r == row) rowList.mapIndexed { c, v -> if (c == col) value else v } else rowList
+        }
+        _uiState.update { it.copy(values = newValues, isModified = true, canUndo = true, canRedo = false) }
+        // runCatching: sel buruk (di luar rentang, tune belum siap) tidak
+        // boleh menjatuhkan app — UI sudah menampilkan nilai yang diedit.
+        tableDef?.let { runCatching { tuneManager.updateTableCell(tableName, row, col, value) } }
+    }
+
+    // v1.2.0 — Edit axis bin (RPM/Load bins) lewat tap header di tune editor.
+    fun setXBin(idx: Int, value: Double) {
+        val st = _uiState.value
+        if (idx !in st.xBins.indices) return
+        if (st.xBins[idx] == value) return
+        pushUndo()
+        val newBins = st.xBins.mapIndexed { i, v -> if (i == idx) value else v }
+        _uiState.update { it.copy(xBins = newBins, isModified = true, canUndo = true, canRedo = false) }
+        tableDef?.let { runCatching { tuneManager.updateTableAxisBin(it.name, true, idx, value) } }
+    }
+
+    fun setYBin(idx: Int, value: Double) {
+        val st = _uiState.value
+        if (idx !in st.yBins.indices) return
+        if (st.yBins[idx] == value) return
+        pushUndo()
+        val newBins = st.yBins.mapIndexed { i, v -> if (i == idx) value else v }
+        _uiState.update { it.copy(yBins = newBins, isModified = true, canUndo = true, canRedo = false) }
+        tableDef?.let { runCatching { tuneManager.updateTableAxisBin(it.name, false, idx, value) } }
+    }
+
+    fun scaleSelected(factor: Double) {
+        val cells = getSelectedCells() ?: return
+        requestOrRunBulk("Scale ${cells.size} cell ×$factor", cells.size) {
+            pushUndo()
+            val mutable = toMutableValues()
+            TableOperations.scaleCells(cells, factor, mutable)
+            applyValues(mutable)
+        }
+    }
+
+    fun smoothSelected(passes: Int = 1) {
+        val st = _uiState.value
+        val cells = (0 until st.rows).flatMap { r -> (0 until st.cols).map { c -> r to c } }
+        requestOrRunBulk("Smooth seluruh tabel (${cells.size} cell)", cells.size) {
+            val mutable = toMutableValues()
+            TableOperations.smoothTable(mutable, cells, passes)
+            pushUndo()
+            applyValues(mutable)
+        }
+    }
+
+    fun interpolateSelected() {
+        val st = _uiState.value
+        val cells = (0 until st.rows).flatMap { r -> (0 until st.cols).map { c -> r to c } }
+        requestOrRunBulk("Interpolate seluruh tabel (${cells.size} cell)", cells.size) {
+            pushUndo()
+            val mutable = toMutableValues()
+            TableOperations.interpolateCells(
+                table = mutable,
+                selectedCells = cells,
+                values = st.values,
+                rows = st.rows,
+                cols = st.cols
+            )
+            applyValues(mutable)
+        }
+    }
+
+    fun setCellsEqual() {
+        val cells = getSelectedCells() ?: return
+        requestOrRunBulk("Set ${cells.size} cell ke nilai sama", cells.size) {
+            pushUndo()
+            val mutable = toMutableValues()
+            TableOperations.setCellsEqual(cells, emptyList(), mutable)
+            applyValues(mutable)
+        }
+    }
+
+    fun addOffset(offset: Double) {
+        val cells = getSelectedCells() ?: return
+        requestOrRunBulk("Tambah offset $offset ke ${cells.size} cell", cells.size) {
+            pushUndo()
+            val mutable = toMutableValues()
+            TableOperations.addOffset(cells, offset, mutable)
+            applyValues(mutable)
+        }
+    }
+
+    fun toggleCellLock() {
+        val cell = _uiState.value.selectedCell ?: return
+        if (cell in lockedCells) lockedCells.remove(cell) else lockedCells.add(cell)
+    }
+
+    /**
+     * Undo the last cell edit.
+     *
+     * Phase 5 fix: Previously, undo only restored the UI state (displayed
+     * values) but did NOT revert the pageData bytes that were already
+     * encoded by [applyValues] → [tuneManager.updateTableCell]. This meant
+     * that after undo, displayed values ≠ stored values, and a subsequent
+     * save/burn would write the post-edit bytes instead of the pre-edit ones.
+     *
+     * Now: undo re-encodes every reverted cell back into pageData via
+     * [tuneManager.updateTableCell], so displayed and stored values stay
+     * in sync.
+     */
+    fun undo() {
+        if (undoStack.isEmpty()) return
+        redoStack.addLast(_uiState.value.values.map { it.toList() })
+        val prev = undoStack.removeLast()
+        // Re-encode reverted values into pageData
+        tableDef?.let { tbl ->
+            for (r in prev.indices) {
+                for (c in prev[r].indices) {
+                    runCatching { tuneManager.updateTableCell(tableName, r, c, prev[r][c]) }
+                }
+            }
+        }
+        _uiState.update { it.copy(values = prev, isModified = true, canUndo = undoStack.isNotEmpty(), canRedo = true) }
+    }
+
+    /**
+     * Redo a previously undone edit.
+     *
+     * Like [undo], this re-encodes the redone values into pageData.
+     */
+    fun redo() {
+        if (redoStack.isEmpty()) return
+        undoStack.addLast(_uiState.value.values.map { it.toList() })
+        val next = redoStack.removeLast()
+        // Re-encode redone values into pageData
+        tableDef?.let { tbl ->
+            for (r in next.indices) {
+                for (c in next[r].indices) {
+                    runCatching { tuneManager.updateTableCell(tableName, r, c, next[r][c]) }
+                }
+            }
+        }
+        _uiState.update { it.copy(values = next, isModified = true, canUndo = true, canRedo = redoStack.isNotEmpty()) }
+    }
+
+    /**
+     * Burn the current table to the ECU.
+     *
+     * Phase 6-7: Real write → verify → burn implementation.
+     *
+     * Flow:
+     *   1. Get the table's page number and page data from TuneManager
+     *   2. Call connectionManager.burnPageSafely(page, pageData) which does:
+     *      a. Read current page (backup)
+     *      b. Write new page data to ECU RAM
+     *      c. Read back and verify byte-for-byte
+     *      d. If verify passes → burn to flash
+     *      e. If verify fails → restore backup, abort
+     *   3. Update UI state based on result
+     *
+     * BUILD-UNVERIFIED: This is the first real ECU write path. It has not
+     * been tested with real hardware. The safety layer (backup/verify/restore)
+     * is statically reviewed but requires runtime validation.
+     */
+    fun burnTable() {
+        val tbl = tableDef ?: run {
+            _uiState.update { it.copy(burnError = "No table definition loaded") }
+            return
+        }
+        val tune = tuneManager.currentTune ?: run {
+            _uiState.update { it.copy(burnError = "No tune loaded") }
+            return
+        }
+        val pageData = tune.getPageData(tbl.valuesPage) ?: run {
+            _uiState.update { it.copy(burnError = "No page data for page ${tbl.valuesPage}") }
+            return
+        }
+
+        _uiState.update { it.copy(isBurning = true, burnError = null) }
+
+        viewModelScope.launch {
+            val result = connectionManager.burnPageSafely(
+                page = tbl.valuesPage,
+                pageData = pageData
+            )
+            result.fold(
+                onSuccess = {
+                    _uiState.update {
+                        it.copy(isBurning = false, isModified = false, burnError = null)
+                    }
+                },
+                onFailure = { e ->
+                    _uiState.update {
+                        it.copy(isBurning = false, burnError = e.message ?: "Burn failed")
+                    }
+                }
+            )
+        }
+    }
+
+    private fun getSelectedCells(): List<Pair<Int, Int>>? {
+        val st = _uiState.value
+        if (st.selectedCells.isNotEmpty()) return st.selectedCells.toList()
+        val cell = st.selectedCell ?: return null
+        return listOf(cell)
+    }
+
+    private fun pushUndo() {
+        if (undoStack.size >= maxHistoryDepth) undoStack.removeFirst()
+        undoStack.addLast(_uiState.value.values.map { it.toList() })
+        redoStack.clear()
+    }
+
+    private fun toMutableValues(): MutableList<MutableList<Double>> {
+        return _uiState.value.values.map { it.toMutableList() }.toMutableList()
+    }
+
+    private fun applyValues(mutable: MutableList<MutableList<Double>>) {
+        val immutable = mutable.map { it.toList() }
+        _uiState.update { it.copy(values = immutable, isModified = true, canUndo = true, canRedo = false) }
+        tableDef?.let { tbl ->
+            for (r in immutable.indices) {
+                for (c in immutable[r].indices) {
+                    runCatching { tuneManager.updateTableCell(tableName, r, c, immutable[r][c]) }
+                }
+            }
+        }
+    }
+
+    // --- Demo data (fallback paling akhir kalau ztune.ini sendiri gagal parse) ---
+    private data class DemoTable(val title: String, val rows: Int, val cols: Int,
+        val xBins: List<Double>, val yBins: List<Double>, val values: List<List<Double>>,
+        val units: String, val format: String, val min: Double, val max: Double)
+
+    private fun demoTable(name: String): DemoTable = when {
+        name.lowercase().contains("ign") || name.lowercase().contains("spark") -> demoIgnitionTable()
+        name.lowercase().contains("afr") -> demoAfrTable()
+        name.lowercase().contains("ve") -> demoVeTable()
+        else -> demoGenericTable()
+    }
+
+    // Rentang RPM 800–14000 ini mengikuti definisi veRpmBins/afrRpmBins/advRpmBins
+    // di ztune.ini, bukan angka baru — dipakai HANYA kalau ztune.ini gagal total.
+    private fun demoRpmBins14k(): List<Double> {
+        val min = 800.0; val max = 14000.0; val n = 16
+        return List(n) { i -> Math.round(min + (max - min) * i / (n - 1)).toDouble() }
+    }
+
+    private fun demoVeTable(): DemoTable {
+        val rpm = demoRpmBins14k()
+        val map = listOf(20.0,30.0,40.0,50.0,60.0,70.0,80.0,90.0,100.0,105.0,110.0,115.0,120.0,130.0,140.0,150.0)
+        val vals = List(map.size) { r -> List(rpm.size) { c ->
+            val rn = c/(rpm.size-1.0); val mn = r/(map.size-1.0)
+            (40.0 + Math.exp(-((rn-0.6)*(rn-0.6)*4.0+(mn-0.7)*(mn-0.7)*4.0))*90.0 + ((r*7+c*13)%5-2)).coerceIn(20.0,130.0)
+        }}
+        return DemoTable("VE Table",map.size,rpm.size,rpm,map,vals,"%","0.0",20.0,130.0)
+    }
+    private fun demoIgnitionTable(): DemoTable {
+        val rpm = demoRpmBins14k()
+        val map = listOf(20.0,30.0,40.0,50.0,60.0,70.0,80.0,90.0,100.0,105.0,110.0,115.0,120.0,130.0,140.0,150.0)
+        val vals = List(map.size) { r -> List(rpm.size) { c ->
+            (10.0 + c/(rpm.size-1.0)*35.0 - r/(map.size-1.0)*25.0 + ((r*3+c*11)%4-2)*0.5).coerceIn(5.0,45.0)
+        }}
+        return DemoTable("Ignition Timing",map.size,rpm.size,rpm,map,vals,"°","0.0",5.0,45.0)
+    }
+    private fun demoAfrTable(): DemoTable {
+        val rpm = demoRpmBins14k()
+        val map = listOf(20.0,40.0,60.0,80.0,100.0,120.0,140.0,160.0)
+        val vals = List(map.size) { r -> List(rpm.size) { c ->
+            (15.5 - r/(map.size-1.0)*2.0 - c/(rpm.size-1.0)*0.5 + ((r*5+c*9)%3-1)*0.1).coerceIn(10.5,16.0)
+        }}
+        return DemoTable("AFR Target",map.size,rpm.size,rpm,map,vals,":1","0.0",10.5,16.0)
+    }
+    private fun demoGenericTable(): DemoTable {
+        val s = 8; val x = List(s){it*1000.0}; val y = List(s){20.0+it*10.0}
+        return DemoTable("Table",s,s,x,y,List(s){r->List(s){c->50.0+r*3.0+c*2.0}},"","0.0",40.0,120.0)
+    }
+
+    data class TableEditorUiState(
+        val tableName: String = "", val title: String = "", val rows: Int = 0, val cols: Int = 0,
+        val xBins: List<Double> = emptyList(), val yBins: List<Double> = emptyList(),
+        val values: List<List<Double>> = emptyList(), val selectedCell: Pair<Int, Int>? = null,
+        val selectedCells: Set<Pair<Int, Int>> = emptySet(),
+        val isModified: Boolean = false, val units: String = "", val format: String = "0.0",
+        val min: Double = 0.0, val max: Double = 255.0, val canUndo: Boolean = false,
+        val canRedo: Boolean = false, val isBurning: Boolean = false,
+        val burnError: String? = null,
+        val liveXValue: Double? = null, val liveYValue: Double? = null,
+        val liveCell: Pair<Int, Int>? = null,
+        val showContextMenu: Boolean = false,
+        val contextMenuCell: Pair<Int, Int>? = null,
+        val tableStats: TableStats? = null,
+        val notConnected: Boolean = false,
+        val pendingBulkAction: PendingBulkAction? = null
+    )
+
+    companion object {
+        /** Operasi yang menyentuh lebih dari ini butuh konfirmasi dulu (audit finding #17). */
+        const val BULK_EDIT_CONFIRM_THRESHOLD = 30
+    }
+
+    data class TableStats(
+        val min: Double, val max: Double, val avg: Double,
+        val cellCount: Int, val nonZeroCount: Int
+    )
+
+    fun calculateStats(): TableStats? {
+        val st = _uiState.value
+        if (st.values.isEmpty()) return null
+        val all = st.values.flatten().filter { !it.isNaN() }
+        if (all.isEmpty()) return null
+        return TableStats(
+            min = all.min(), max = all.max(), avg = all.average(),
+            cellCount = all.size, nonZeroCount = all.count { it != 0.0 }
+        )
+    }
+
+    fun showContextMenu(row: Int, col: Int) {
+        _uiState.update { it.copy(showContextMenu = true, contextMenuCell = Pair(row, col)) }
+    }
+
+    fun hideContextMenu() {
+        _uiState.update { it.copy(showContextMenu = false, contextMenuCell = null) }
+    }
+
+    fun clearBurnError() {
+        _uiState.update { it.copy(burnError = null) }
+    }
+
+    // ---- Rebin (resize axis) ----
+    fun rebin(newRows: Int, newCols: Int) {
+        val st = _uiState.value
+        if (newRows < 2 || newCols < 2) return
+        if (st.rows == 0 || st.cols == 0) return
+        pushUndo()
+        val oldValues = st.values
+        val oldX = st.xBins
+        val oldY = st.yBins
+
+        // Generate new axis bins (linear interpolation between old min/max)
+        val newXBins = (0 until newCols).map { i ->
+            if (oldX.isNotEmpty()) {
+                val t = i.toDouble() / (newCols - 1)
+                oldX.first() + t * (oldX.last() - oldX.first())
+            } else i.toDouble() * 500
+        }
+        val newYBins = (0 until newRows).map { i ->
+            if (oldY.isNotEmpty()) {
+                val t = i.toDouble() / (newRows - 1)
+                oldY.first() + t * (oldY.last() - oldY.first())
+            } else 20.0 + i * 10
+        }
+
+        // Bilinear resample
+        val newValues = (0 until newRows).map { r ->
+            (0 until newCols).map { c ->
+                if (oldValues.isNotEmpty() && oldValues[0].isNotEmpty()) {
+                    val fy = if (newRows > 1) r.toDouble() / (newRows - 1) * (st.rows - 1) else 0.0
+                    val fx = if (newCols > 1) c.toDouble() / (newCols - 1) * (st.cols - 1) else 0.0
+                    val r0 = fy.toInt().coerceIn(0, st.rows - 1)
+                    val r1 = (r0 + 1).coerceIn(0, st.rows - 1)
+                    val c0 = fx.toInt().coerceIn(0, st.cols - 1)
+                    val c1 = (c0 + 1).coerceIn(0, st.cols - 1)
+                    val fr = fy - r0
+                    val fc = fx - c0
+                    val v00 = oldValues[r0][c0]
+                    val v01 = oldValues[r0][c1]
+                    val v10 = oldValues[r1][c0]
+                    val v11 = oldValues[r1][c1]
+                    v00 * (1-fc) * (1-fr) + v01 * fc * (1-fr) + v10 * (1-fc) * fr + v11 * fc * fr
+                } else 0.0
+            }
+        }
+        _uiState.update { it.copy(values = newValues, xBins = newXBins, yBins = newYBins,
+            rows = newRows, cols = newCols, isModified = true, canUndo = true, canRedo = false) }
+    }
+
+    // ---- Table comparison ----
+    data class TableDiff(
+        val cellDiffs: Map<Pair<Int, Int>, Pair<Double, Double>>, // (row,col) → (old, new)
+        val maxChange: Double,
+        val avgChange: Double,
+        val changedCells: Int
+    )
+
+    fun compareTo(other: List<List<Double>>): TableDiff {
+        val st = _uiState.value
+        val diffs = mutableMapOf<Pair<Int, Int>, Pair<Double, Double>>()
+        var maxCh = 0.0
+        var sumCh = 0.0
+        var count = 0
+        for (r in 0 until minOf(st.rows, other.size)) {
+            for (c in 0 until minOf(st.cols, other[r].size)) {
+                val mine = st.values[r][c]
+                val theirs = other[r][c]
+                if (mine != theirs) {
+                    val ch = mine - theirs
+                    diffs[Pair(r, c)] = Pair(theirs, mine)
+                    if (kotlin.math.abs(ch) > kotlin.math.abs(maxCh)) maxCh = ch
+                    sumCh += kotlin.math.abs(ch)
+                    count++
+                }
+            }
+        }
+        return TableDiff(diffs, maxCh, if (count > 0) sumCh / count else 0.0, count)
+    }
+}

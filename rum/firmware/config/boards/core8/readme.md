@@ -1,1 +1,0 @@
-Moved to https://github.com/rusefi/fw-custom-core8

@@ -1,3 +1,0 @@
-(sym_lib_table
-  (lib (name PT2000)(type Legacy)(uri ${KIPRJMOD}/../rusefi_lib/PT2000.lib)(options "")(descr ""))
-)

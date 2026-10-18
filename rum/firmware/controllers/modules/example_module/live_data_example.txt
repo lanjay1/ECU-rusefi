@@ -1,3 +1,0 @@
-struct_no_prefix live_data_example_s
-  float liveDataExampleField
-end_struct

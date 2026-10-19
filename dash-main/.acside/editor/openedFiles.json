@@ -1,0 +1,20 @@
+{
+  "allFiles": [
+    {
+      "file": "/storage/emulated/0/ztunkt/dash-main/app/src/main/java/com/ztune/libretune/core/protocol/ZtuneProtocol.kt",
+      "selection": {
+        "end": {
+          "column": 1,
+          "index": 8404,
+          "line": 242
+        },
+        "start": {
+          "column": 1,
+          "index": 8404,
+          "line": 242
+        }
+      }
+    }
+  ],
+  "selectedFile": "/storage/emulated/0/ztunkt/dash-main/app/src/main/java/com/ztune/libretune/core/protocol/ZtuneProtocol.kt"
+}

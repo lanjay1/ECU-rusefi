@@ -5,24 +5,21 @@ import com.ztune.libretune.core.ini.types.Constant
 import com.ztune.libretune.core.ini.types.DataType
 
 /**
- * Phase 28: Pin Conflict Detection.
+ * Deteksi konflik pin pada konfigurasi ECU.
  *
- * Detects when two ECU functions are assigned to the same physical pin,
- * which can cause hardware damage or unpredictable behavior.
+ * Detector ini hanya menganggap constant bertipe BITS sebagai kandidat
+ * assignment pin. Nilai aktual dapat diberikan melalui [getValue].
  *
- * Works by scanning [EcuDefinition.constants] for bits-type constants
- * whose names suggest pin assignment (e.g. "fuelPumpPin", "fanPin").
- * Constants whose INI enabled_condition evaluates to false are excluded
- * (feature is disabled, so the pin is not claimed).
- *
- * Inspired by LibreTune's pin_conflict.rs.
+ * Jika [getValue] tidak tersedia, detector akan mencoba menggunakan
+ * [EcuDefinition.defaultValues]. Jika tidak ada default value, index 0
+ * digunakan sebagai fallback terakhir.
  */
 data class PinConflict(
     val pinLabel: String,
     val constants: List<String>
 ) {
     val description: String
-        get() = "Pin '$pinLabel' used by: ${constants.joinToString(", ")}"
+        get() = "Pin '$pinLabel' digunakan oleh: ${constants.joinToString(", ")}"
 }
 
 data class PinConflictReport(
@@ -30,51 +27,97 @@ data class PinConflictReport(
     val totalPinConstants: Int,
     val activePinConstants: Int
 ) {
-    val hasConflicts: Boolean get() = conflicts.isNotEmpty()
+    val hasConflicts: Boolean
+        get() = conflicts.isNotEmpty()
+
     val summary: String
         get() = if (hasConflicts) {
-            "Pin conflict(s) detected:\n" + conflicts.joinToString("\n") { "  • ${it.description}" }
+            "Konflik pin terdeteksi:\n" +
+                conflicts.joinToString("\n") {
+                    "  • ${it.description}"
+                }
         } else {
-            "No pin conflicts detected ($activePinConstants active pin assignments)."
+            "Tidak ada konflik pin ($activePinConstants assignment aktif)."
         }
 }
 
 object PinConflictDetector {
 
-    private val PIN_NAME_PATTERNS = listOf("pin", "outputpin", "inputpin", "gpiopin")
-    private val EXCLUDE_PATTERNS = listOf("pinmode", "pinvert", "pindir", "pinpull", "pintype")
-    private val UNASSIGNED_LABELS = setOf("none", "off", "disabled", "invalid", "no pin", "n/a", "")
-    private val BOARD_DEFAULT = "board default"
+    private val PIN_NAME_PATTERNS = listOf(
+        "pin",
+        "outputpin",
+        "inputpin",
+        "gpiopin"
+    )
+
+    private val EXCLUDE_PATTERNS = listOf(
+        "pinmode",
+        "pinvert",
+        "pindir",
+        "pinpull",
+        "pintype"
+    )
+
+    private val UNASSIGNED_LABELS = setOf(
+        "",
+        "none",
+        "off",
+        "disabled",
+        "invalid",
+        "no pin",
+        "n/a"
+    )
+
+    private const val BOARD_DEFAULT = "board default"
 
     /**
-     * Detect pin conflicts in the given [definition].
+     * Mendeteksi semua konflik assignment pin pada ECU definition.
      *
-     * @param definition The ECU definition to scan.
-     * @param getValue Function that returns the current value (as index into
-     *   bitOptions) for a given constant name. If null, the constant's
-     *   default value is used.
-     * @return [PinConflictReport] with all detected conflicts.
+     * @param definition definisi ECU yang akan diperiksa.
+     * @param getValue fungsi untuk mengambil nilai aktual constant.
+     * Jika null, defaultValues dari definition digunakan.
      */
     fun detectConflicts(
         definition: EcuDefinition,
         getValue: ((String) -> Int?)? = null
     ): PinConflictReport {
-        val pinConstants = definition.constants.values.filter { isPinConstant(it) }
+
+        val pinConstants = definition.constants.values
+            .filter(::isPinConstant)
+
         val pinAssignments = mutableMapOf<String, MutableList<String>>()
 
         for (constant in pinConstants) {
-            val valueIndex = getValue?.invoke(constant.name) ?: 0
-            val pinLabel = resolvePinLabel(constant, valueIndex)
+            val valueIndex = resolveValueIndex(
+                definition = definition,
+                constant = constant,
+                getValue = getValue
+            )
 
-            // Skip unassigned / board default
-            if (pinLabel.isBlank() || isUnassigned(pinLabel) || isBoardDefault(pinLabel)) continue
+            val pinLabel = resolvePinLabel(
+                constant = constant,
+                valueIndex = valueIndex
+            )
 
-            pinAssignments.getOrPut(pinLabel) { mutableListOf() }.add(constant.name)
+            if (isUnassigned(pinLabel) || isBoardDefault(pinLabel)) {
+                continue
+            }
+
+            val normalizedPin = normalizePinLabel(pinLabel)
+
+            pinAssignments
+                .getOrPut(normalizedPin) { mutableListOf() }
+                .add(constant.name)
         }
 
         val conflicts = pinAssignments
-            .filter { it.value.size > 1 }
-            .map { (pin, consts) -> PinConflict(pin, consts.sorted()) }
+            .filter { (_, constants) -> constants.size > 1 }
+            .map { (pin, constants) ->
+                PinConflict(
+                    pinLabel = pin,
+                    constants = constants.distinct().sorted()
+                )
+            }
             .sortedBy { it.pinLabel }
 
         return PinConflictReport(
@@ -85,55 +128,155 @@ object PinConflictDetector {
     }
 
     /**
-     * Check if a constant is a pin assignment constant.
+     * Menentukan index nilai constant.
+     *
+     * Urutan prioritas:
+     *
+     * 1. getValue dari caller.
+     * 2. defaultValues dari EcuDefinition.
+     * 3. index 0 sebagai fallback.
+     *
+     * Default value dianggap sebagai nilai display/raw yang kemudian
+     * dikonversi menjadi index bit option.
      */
-    private fun isPinConstant(constant: Constant): Boolean {
-        if (constant.dataType != DataType.BITS) return false
-        if (constant.bitOptions.size < 3) return false
+    private fun resolveValueIndex(
+        definition: EcuDefinition,
+        constant: Constant,
+        getValue: ((String) -> Int?)?
+    ): Int {
 
-        val nameLower = constant.name.lowercase()
-        if (EXCLUDE_PATTERNS.any { nameLower.contains(it) }) return false
+        getValue?.invoke(constant.name)?.let { value ->
+            return value
+        }
 
-        return PIN_NAME_PATTERNS.any { nameLower.contains(it) } ||
-            constant.bitOptions.any { looksLikePinLabel(it) }
+        definition.defaultValues[constant.name]?.let { value ->
+            val rounded = value.toInt()
+
+            if (rounded in constant.bitOptions.indices) {
+                return rounded
+            }
+        }
+
+        return 0
     }
 
     /**
-     * Resolve the pin label for a constant at a given value index.
+     * Memeriksa apakah constant merupakan assignment pin.
      */
-    private fun resolvePinLabel(constant: Constant, valueIndex: Int): String {
-        if (valueIndex !in constant.bitOptions.indices) return ""
+    private fun isPinConstant(constant: Constant): Boolean {
+        if (constant.dataType != DataType.BITS) {
+            return false
+        }
+
+        if (constant.bitOptions.size < 3) {
+            return false
+        }
+
+        val nameLower = constant.name.lowercase()
+
+        if (EXCLUDE_PATTERNS.any { nameLower.contains(it) }) {
+            return false
+        }
+
+        return PIN_NAME_PATTERNS.any { nameLower.contains(it) } ||
+            constant.bitOptions.any(::looksLikePinLabel)
+    }
+
+    /**
+     * Mengambil label pin berdasarkan index bit option.
+     */
+    private fun resolvePinLabel(
+        constant: Constant,
+        valueIndex: Int
+    ): String {
+
+        if (valueIndex !in constant.bitOptions.indices) {
+            return ""
+        }
+
         return constant.bitOptions[valueIndex].trim()
     }
 
     /**
-     * Check if a label looks like a pin identifier (e.g. "PA0", "PD13").
+     * Normalisasi label pin supaya perbandingan tidak sensitif terhadap
+     * huruf besar/kecil atau spasi yang tidak diperlukan.
+     *
+     * Contoh:
+     * "PA0" -> "PA0"
+     * "pa0" -> "PA0"
+     * " PA0 " -> "PA0"
+     */
+    private fun normalizePinLabel(label: String): String {
+        return label.trim()
+            .replace(Regex("\\s+"), " ")
+            .uppercase()
+    }
+
+    /**
+     * Memeriksa apakah label menunjukkan pin yang valid.
+     *
+     * Contoh:
+     * PA0
+     * PB5
+     * PC13
+     * PD7
+     * D0
+     * D13
+     * A0
+     * A5
      */
     private fun looksLikePinLabel(label: String): Boolean {
-        val upper = label.uppercase()
-        // STM32-style: PA0, PB5, PC13, PD7, etc.
-        if (upper.length in 2..5 && upper[0] == 'P' && upper[1] in 'A'..'Z' &&
-            upper.drop(2).all { it.isDigit() }) return true
-        // Arduino-style: D0, D13, A0, A5
-        if (upper.length in 2..4 && upper[0] in 'D'..'E' && upper.drop(1).all { it.isDigit() }) return true
-        // Generic pin labels
-        if (upper.contains("PIN") && upper.any { it.isDigit() }) return true
+        val upper = label.trim().uppercase()
+
+        // STM32-style:
+        // PA0, PB5, PC13, PD7, etc.
+        if (
+            upper.length in 3..5 &&
+            upper[0] == 'P' &&
+            upper[1] in 'A'..'Z' &&
+            upper.drop(2).all { it.isDigit() }
+        ) {
+            return true
+        }
+
+        // Arduino-style:
+        // D0, D13, A0, A5
+        if (
+            upper.length in 2..4 &&
+            upper[0] in charArrayOf('A', 'D') &&
+            upper.drop(1).all { it.isDigit() }
+        ) {
+            return true
+        }
+
+        // Generic pin labels:
+        // "PIN1", "PIN12", etc.
+        if (
+            upper.contains("PIN") &&
+            upper.any { it.isDigit() }
+        ) {
+            return true
+        }
+
         return false
     }
 
     private fun isUnassigned(label: String): Boolean {
-        val lower = label.lowercase().trim()
-        return lower in UNASSIGNED_LABELS
+        return label.trim()
+            .lowercase() in UNASSIGNED_LABELS
     }
 
     private fun isBoardDefault(label: String): Boolean {
-        return label.lowercase().trim() == BOARD_DEFAULT
+        return label.trim()
+            .lowercase() == BOARD_DEFAULT
     }
 
     /**
-     * Check if assigning a specific value to a constant would create a conflict.
+     * Memeriksa apakah perubahan nilai sebuah constant akan menimbulkan
+     * konflik dengan assignment pin lain.
      *
-     * @return The conflicting constant names if a conflict would occur, empty list otherwise.
+     * Constant yang sedang diperiksa sendiri tidak dimasukkan sebagai
+     * konflik.
      */
     fun wouldConflict(
         definition: EcuDefinition,
@@ -141,17 +284,39 @@ object PinConflictDetector {
         newValueIndex: Int,
         getValue: ((String) -> Int?)? = null
     ): List<String> {
-        val target = definition.constants[constantName] ?: return emptyList()
-        if (!isPinConstant(target)) return emptyList()
-        val newPin = resolvePinLabel(target, newValueIndex)
-        if (isUnassigned(newPin) || isBoardDefault(newPin)) return emptyList()
 
-        val report = detectConflicts(definition, getValue)
-        // Check if any existing conflict involves this pin (excluding ourselves)
+        val target = definition.constants[constantName]
+            ?: return emptyList()
+
+        if (!isPinConstant(target)) {
+            return emptyList()
+        }
+
+        val newPin = resolvePinLabel(
+            constant = target,
+            valueIndex = newValueIndex
+        )
+
+        if (
+            isUnassigned(newPin) ||
+            isBoardDefault(newPin)
+        ) {
+            return emptyList()
+        }
+
+        val normalizedNewPin = normalizePinLabel(newPin)
+
+        val report = detectConflicts(
+            definition = definition,
+            getValue = getValue
+        )
+
         return report.conflicts
-            .firstOrNull { it.pinLabel.equals(newPin, ignoreCase = true) }
+            .firstOrNull {
+                normalizePinLabel(it.pinLabel) == normalizedNewPin
+            }
             ?.constants
             ?.filter { it != constantName }
-            ?: emptyList()
+            .orEmpty()
     }
 }

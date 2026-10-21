@@ -215,24 +215,27 @@ class RealtimeChannelStore {
      * @param default Fallback when the channel is absent.
      * @return A [StateFlow] of the channel's current value.
      */
-    fun observeChannel(name: String, default: Double = 0.0): StateFlow<Double> {
-        val resolved = resolveAlias(name)
-        return channels.map { it[resolved] ?: default }
-            // .map on StateFlow produces a cold flow; we re-expose as StateFlow
-            // by collecting into a MutableStateFlow internally.
-            .let { derived ->
-                val sf = MutableStateFlow(channels.value[resolved] ?: default)
-                // We can't hot-collect here without a scope, so instead we
-                // provide a companion factory that accepts a CoroutineScope.
-                // For the scope-less overload, return a stateflow that reads
-                // from the source on each collection.
-                sf
-            }
+  fun observeChannel(name: String, default: Double = 0.0): kotlinx.coroutines.flow.Flow<Double> {
+    return channels.map { current ->
+        val resolved = resolveAliasAgainstChannels(name, current)
+        current[resolved] ?: default
+    }
+}
+
+  private fun resolveAliasAgainstChannels(
+    name: String,
+    current: Map<String, Double>
+): String {
+    val aliases = CHANNEL_ALIASES[name] ?: return name
+
+    for (alias in aliases) {
+        if (alias in current) {
+            return alias
+        }
     }
 
-    /**
-     * List the names of all channels that currently have values.
-     */
+    return name
+}
     fun activeChannelNames(): Set<String> = _channels.value.keys
 
     /**

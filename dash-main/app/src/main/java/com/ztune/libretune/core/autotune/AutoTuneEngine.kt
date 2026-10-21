@@ -5,70 +5,42 @@ import kotlin.math.abs
 /**
  * Configuration for the AutoTune engine.
  *
- * v1.3.2 — Wired to the safety/correctness logic in [AutoTuneLogic.kt] that was
- * previously written but never called by anything (see audit finding #2):
- *  - [filters] / [classifySample]: reject samples during DFCO/fuel-cut,
- *    accel-enrichment, cold engine, transient TPS, and railed AFR sensor.
- *  - [authorityLimits]: proper 3-stage clamp (absolute delta → percentage →
- *    absolute rails) instead of a single blunt percent clamp.
- *  - [calculateRequiredVe] + [VECorrectionEWMA]: correction computed from the
- *    reference VE table value (not the ECU's interpolated veCurr), with a
- *    confidence ramp so sparse cells don't propose full-strength changes.
- *  - [LambdaDelayBuffer] + [getLambdaDelayMs]: compensates for exhaust
- *    transport delay so an AFR reading is attributed to the (rpm, load) the
- *    engine was actually at `delay_ms` ago, not the state at the moment the
- *    sensor reading arrived.
+ * The engine is intentionally conservative:
+ * - invalid table dimensions are rejected
+ * - RPM/load axes must be finite and strictly ascending
+ * - samples outside the actual table axis are never assigned to edge cells
+ * - smoothing never creates adjustments in cells without sufficient data
+ * - authority limits are applied after smoothing
  */
 data class AutoTuneConfig(
     val veTableName: String = "",
     val targetAfrTableName: String = "",
     val lambdaTargetTables: List<String> = emptyList(),
-    /** Maximum fractional change per autotune pass (e.g. 0.1 = 10%). Feeds [authorityLimits]. */
+    /** Maximum fractional change per autotune pass (0.1 = 10%). */
     val authority: Float = 0.1f,
-    /** Minimum number of samples (EWMA weight) in a cell before it will be adjusted. */
+    /** Minimum EWMA weight required before a cell can be adjusted. */
     val minCellSamples: Int = 5,
     /** Number of smoothing passes applied to the adjustment grid. */
     val smoothingPasses: Int = 3,
-    /** Cells locked out of adjustment, stored as (row, col) pairs. */
+    /** Cells excluded from adjustment, stored as (row, col). */
     val lockedCells: Set<Pair<Int, Int>> = emptySet(),
-    /** Channel name for the measured AFR/Lambda input. */
     val afrChannelName: String = "afr",
-    /** Channel name for the RPM input. */
     val rpmChannelName: String = "rpm",
-    /** Channel name for the load (MAP/TPS) input. */
     val loadChannelName: String = "map",
-    /** Channel name for the target AFR input (looked up with a few fallback aliases too). */
     val targetAfrChannelName: String = "afrTarget",
-    /** Channel name for coolant temperature — used by the cold-engine filter. */
     val cltChannelName: String = "clt",
-    /** Channel name for throttle position — informational, not currently filtered on directly. */
     val tpsChannelName: String = "tps",
-    /** Channel name for TPS rate of change — used by the transient filter. Matches ztune.ini's `tpsdot`. */
     val tpsRateChannelName: String = "tpsdot",
-    /** Sample-rejection filter chain. See [AutoTuneFilters] / [classifySample]. */
     val filters: AutoTuneFilters = AutoTuneFilters(),
     /**
-     * Fixed lambda delay override in ms, or 0 to use the RPM-based curve
-     * ([getLambdaDelayMs]: ~200ms @ 800rpm → ~50ms @ 6000rpm). A 1-cylinder
-     * engine's short exhaust path means this can differ a lot from
-     * multi-cylinder-tuned defaults — see audit finding re: no delay
-     * measurement tool. Until that tool exists, this is the best estimate.
+     * Fixed lambda delay in milliseconds.
+     * 0 means use the RPM-based delay curve.
      */
     val lambdaDelayMs: Double = 0.0
 )
 
 /**
- * Result of a single autotune computation pass.
- *
- * @property adjustments 2D array of percentage adjustments matching the table dimensions.
- *   Each value represents the suggested percent change to the VE cell
- *   (e.g. +5.0 means "increase this cell by 5%").
- * @property heatMap 2D array of per-cell diagnostic info, matching table dimensions.
- * @property totalAdjustments Number of cells that received a non-zero adjustment.
- * @property lockedCellCount Number of cells that were skipped due to being locked.
- * @property rejectedSampleCounts How many raw samples were dropped by each filter reason.
- *   Surfaced so the UI can eventually show "1200 samples fed, 340 rejected: 210 cold engine,
- *   90 transient, 40 AFR railed" instead of a single opaque sample count.
+ * Result of one AutoTune computation pass.
  */
 data class AutoTuneResult(
     val adjustments: List<List<Double>>,
@@ -79,16 +51,7 @@ data class AutoTuneResult(
 )
 
 /**
- * Diagnostic information about a single cell's autotune state.
- *
- * @property row Row index in the VE table.
- * @property col Column index in the VE table.
- * @property sampleCount Number of logged data points that fell into this cell
- *   (EWMA total weight, rounded — with uniform weighting this equals the raw count).
- * @property averageError Average (measured AFR − target AFR) across all samples in this cell.
- *   Positive → engine running richer than target; negative → leaner.
- * @property totalAdjustment Cumulative percentage adjustment applied to this cell.
- * @property isLocked Whether this cell is locked and excluded from adjustment.
+ * Diagnostic information for one VE table cell.
  */
 data class AutoTuneCellInfo(
     val row: Int,
@@ -102,79 +65,103 @@ data class AutoTuneCellInfo(
 /**
  * Core AutoTune engine.
  *
- * Adjusts VE table cells based on logged AFR vs target AFR data.
+ * Pipeline:
  *
- * The engine works in two phases:
- *
- * 1. **Data collection** — [addSample] runs each incoming reading through the
- *    [AutoTuneLogic] safety filter chain ([classifySample]), then through the
- *    [LambdaDelayBuffer] to attribute the (delay-compensated) AFR reading to
- *    the engine's (rpm, load) at the time the exhaust gas was actually
- *    produced. Samples that fail a filter, or that don't have a delay-matched
- *    historical point yet, are dropped (and counted in [AutoTuneResult.rejectedSampleCounts]).
- *
- * 2. **Computation** — [computeAdjustments] bins every accepted sample into the
- *    VE table grid defined by `rpmBins × loadBins`, accumulates a per-cell
- *    [VECorrectionEWMA] of [calculateRequiredVe] observations, and clamps the
- *    proposal through [AutoTuneAuthorityLimits] (3-stage: absolute delta →
- *    percentage of beginning value → absolute rails).
- *
- * Locked cells (see [AutoTuneConfig.lockedCells] / [setCellLocked]) always
- * receive a 0% adjustment and act as anchors during smoothing.
+ *   sample filter
+ *       ↓
+ *   lambda delay compensation
+ *       ↓
+ *   axis validation
+ *       ↓
+ *   safe binning
+ *       ↓
+ *   EWMA
+ *       ↓
+ *   smoothing
+ *       ↓
+ *   authority clamp
+ *       ↓
+ *   heatmap / final result
  */
 class AutoTuneEngine(private val config: AutoTuneConfig) {
 
-    // ------------------------------------------------------------------
-    // Internal state
-    // ------------------------------------------------------------------
-
-    /** Raw samples buffered for lambda-delay lookback (see [LambdaDelayBuffer]). */
     private val lambdaBuffer = LambdaDelayBuffer()
 
-    /** Samples that passed filtering + delay-matching, ready to be binned at compute time. */
     private val processedSamples = mutableListOf<ProcessedSample>()
 
-    /** Runtime set of locked cells (starts from config, mutable via [setCellLocked]). */
     private val lockedCells = config.lockedCells.toMutableSet()
 
-    /** Cached heat map from the most recent [computeAdjustments] call. */
     private var cachedHeatMap: Map<Pair<Int, Int>, AutoTuneCellInfo> = emptyMap()
 
-    /** Counts of rejected raw samples, keyed by reason — for diagnostics. */
-    private val rejectCounts = mutableMapOf<AutoTuneRejectReason, Int>()
-
-    // ------------------------------------------------------------------
-    // Public API
-    // ------------------------------------------------------------------
+    private val rejectCounts =
+        mutableMapOf<AutoTuneRejectReason, Int>()
 
     /**
-     * Accumulate a single data sample, running it through the full
-     * [AutoTuneLogic] safety filter chain and lambda-delay compensation
-     * before it becomes eligible for binning.
+     * Add one realtime/logged AutoTune sample.
      */
     fun addSample(sample: AutoTuneSample) {
+        /*
+         * NaN comparisons are false in Kotlin.
+         *
+         * Therefore classifySample() alone is not sufficient to protect
+         * against NaN/infinite values. Reject them before the filter chain.
+         *
+         * There is currently no dedicated INVALID_NUMERIC_DATA enum in the
+         * existing public API, so these samples are silently discarded here.
+         * Package 6 can add a dedicated diagnostic reason without changing
+         * this engine's public API.
+         */
+        if (
+            !sample.rpm.isFinite() ||
+            !sample.load.isFinite() ||
+            !sample.afr.isFinite() ||
+            !sample.targetAfr.isFinite() ||
+            !sample.clt.isFinite() ||
+            !sample.tps.isFinite() ||
+            !sample.tpsRate.isFinite()
+        ) {
+            return
+        }
+
         val reason = classifySample(sample, config.filters)
+
         if (reason != null) {
-            rejectCounts[reason] = (rejectCounts[reason] ?: 0) + 1
+            rejectCounts[reason] =
+                (rejectCounts[reason] ?: 0) + 1
             return
         }
 
         lambdaBuffer.addSample(sample)
 
-        val delayMs = getLambdaDelayMs(sample.rpm, config.lambdaDelayMs)
-        val delayed = lambdaBuffer.findDelayedSample(sample.timestampMs, delayMs)
+        val delayMs =
+            getLambdaDelayMs(
+                sample.rpm,
+                config.lambdaDelayMs
+            )
+
+        val delayed =
+            lambdaBuffer.findDelayedSample(
+                sample.timestampMs,
+                delayMs
+            )
+
         if (delayed == null) {
-            // Not enough history yet (start of session) to find the engine
-            // state from `delayMs` ago — drop rather than mis-attribute.
-            rejectCounts[AutoTuneRejectReason.NO_LAMBDA_DELAY_MATCH] =
-                (rejectCounts[AutoTuneRejectReason.NO_LAMBDA_DELAY_MATCH] ?: 0) + 1
+            rejectCounts[
+                AutoTuneRejectReason.NO_LAMBDA_DELAY_MATCH
+            ] =
+                (
+                    rejectCounts[
+                        AutoTuneRejectReason.NO_LAMBDA_DELAY_MATCH
+                    ] ?: 0
+                    ) + 1
+
             return
         }
 
-        // Cell attribution uses the DELAYED (historical) rpm/load — that's
-        // the engine state that actually produced the exhaust gas this AFR
-        // reading measures. The AFR/target values are from the CURRENT
-        // sample, since that's the (delayed) reading itself.
+        /*
+         * Use delayed RPM/load for cell attribution.
+         * Use current AFR/target AFR for the measurement.
+         */
         processedSamples.add(
             ProcessedSample(
                 rpm = delayed.rpm,
@@ -186,14 +173,15 @@ class AutoTuneEngine(private val config: AutoTuneConfig) {
     }
 
     /**
-     * Convenience overload for simple (rpm, load, afr, targetAfr)-only callers
-     * that don't have CLT/TPS-rate/enrichment-flag data available. This SKIPS
-     * the cold-engine, transient, and enrichment-active filters entirely
-     * (there's nothing to filter on) — only the RPM/load bounds and AFR-railed
-     * checks still apply. Prefer [addSample] with a full [AutoTuneSample]
-     * whenever that data is available.
+     * Convenience overload for callers that only have:
+     * rpm, load, measured AFR and target AFR.
      */
-    fun addSample(rpm: Double, load: Double, measuredAfr: Double, targetAfr: Double) {
+    fun addSample(
+        rpm: Double,
+        load: Double,
+        measuredAfr: Double,
+        targetAfr: Double
+    ) {
         addSample(
             AutoTuneSample(
                 rpm = rpm,
@@ -201,9 +189,9 @@ class AutoTuneEngine(private val config: AutoTuneConfig) {
                 afr = measuredAfr,
                 targetAfr = targetAfr,
                 ve = 0.0,
-                clt = 999.0,       // deliberately "hot" so the cold-engine filter never fires — no CLT data given
+                clt = 999.0,
                 tps = 0.0,
-                tpsRate = 0.0,     // deliberately zero so the transient filter never fires — no TPS-rate data given
+                tpsRate = 0.0,
                 accelEnrichActive = false,
                 fuelCutActive = false
             )
@@ -211,129 +199,412 @@ class AutoTuneEngine(private val config: AutoTuneConfig) {
     }
 
     /**
-     * Run the autotune algorithm and compute adjustments for every cell.
+     * Compute AutoTune adjustments.
      *
-     * @param currentTableValues Current VE table values as a 2D list (`rows × cols`).
-     *   Used both for dimension checking AND as the reference "beginning value"
-     *   for [calculateRequiredVe] and [AutoTuneAuthorityLimits.clamp] — per-cell,
-     *   not the ECU's interpolated veCurr output.
-     * @param rpmBins RPM axis breakpoints in ascending order. Length must equal
-     *   `currentTableValues[0].size` (number of columns).
-     * @param loadBins Load axis breakpoints in ascending order. Length must equal
-     *   `currentTableValues.size` (number of rows).
-     * @return The computed [AutoTuneResult], or a zero-adjustment result when
-     *   no valid data is available.
+     * The supplied table and axes are treated as one atomic structure:
+     *
+     *   rows    == loadBins.size
+     *   columns == rpmBins.size
+     *
+     * All rows must have identical column counts.
      */
     fun computeAdjustments(
         currentTableValues: List<List<Double>>,
         rpmBins: List<Double>,
         loadBins: List<Double>
     ): AutoTuneResult {
-        val rows = currentTableValues.size
-        val cols = if (rows > 0) currentTableValues[0].size else 0
 
-        // Early return for degenerate inputs.
-        if (rows == 0 || cols == 0 || processedSamples.isEmpty()) {
+        validateConfiguration()
+        validateTableAndAxes(
+            currentTableValues,
+            rpmBins,
+            loadBins
+        )
+
+        val rows = currentTableValues.size
+        val cols = currentTableValues[0].size
+
+        if (processedSamples.isEmpty()) {
             return zeroResult(currentTableValues)
         }
 
-        // --- Step 1: Bin samples into cells, accumulate EWMA of required-VE ---
-        val ewma = Array(rows) { Array(cols) { VECorrectionEWMA() } }
-        val errorSum = Array(rows) { DoubleArray(cols) }
-        val errorCount = Array(rows) { IntArray(cols) }
+        /*
+         * One EWMA object per table cell.
+         */
+        val ewma =
+            Array(rows) {
+                Array(cols) {
+                    VECorrectionEWMA()
+                }
+            }
 
+        /*
+         * Diagnostic AFR error statistics.
+         */
+        val errorSum =
+            Array(rows) {
+                DoubleArray(cols)
+            }
+
+        val errorCount =
+            Array(rows) {
+                IntArray(cols)
+            }
+
+        /*
+         * Whether each cell has enough valid data to participate
+         * in AutoTune and smoothing.
+         */
+        val eligible =
+            Array(rows) {
+                BooleanArray(cols)
+            }
+
+        /*
+         * --------------------------------------------------------------
+         * STEP 1
+         * Safe binning + EWMA accumulation
+         * --------------------------------------------------------------
+         */
         for (sample in processedSamples) {
-            val row = binIndex(sample.load, loadBins)
-            val col = binIndex(sample.rpm, rpmBins)
-            if (row !in 0 until rows || col !in 0 until cols) continue
 
-            val beginningValue = currentTableValues[row][col]
-            val requiredVe = calculateRequiredVe(beginningValue, sample.afr, sample.targetAfr)
-            ewma[row][col].addObservation(requiredVe)
+            /*
+             * Out-of-axis samples are explicitly rejected.
+             *
+             * This is critical:
+             *
+             * RPM axis:
+             *   1000 2000 3000 4000
+             *
+             * Sample:
+             *   8000 RPM
+             *
+             * must NOT become cell 4000 RPM.
+             */
+            val row =
+                binIndex(
+                    sample.load,
+                    loadBins
+                )
 
-            errorSum[row][col] += (sample.afr - sample.targetAfr)
+            if (row < 0) {
+                rejectCounts[
+                    AutoTuneRejectReason.LOAD_OUT_OF_RANGE
+                ] =
+                    (
+                        rejectCounts[
+                            AutoTuneRejectReason.LOAD_OUT_OF_RANGE
+                        ] ?: 0
+                        ) + 1
+
+                continue
+            }
+
+            val col =
+                binIndex(
+                    sample.rpm,
+                    rpmBins
+                )
+
+            if (col < 0) {
+                rejectCounts[
+                    AutoTuneRejectReason.RPM_OUT_OF_RANGE
+                ] =
+                    (
+                        rejectCounts[
+                            AutoTuneRejectReason.RPM_OUT_OF_RANGE
+                        ] ?: 0
+                        ) + 1
+
+                continue
+            }
+
+            val beginningValue =
+                currentTableValues[row][col]
+
+            /*
+             * Non-finite table values must never enter the correction
+             * calculation.
+             */
+            if (!beginningValue.isFinite()) {
+                continue
+            }
+
+            val requiredVe =
+                calculateRequiredVe(
+                    beginningValue,
+                    sample.afr,
+                    sample.targetAfr
+                )
+
+            if (!requiredVe.isFinite()) {
+                continue
+            }
+
+            ewma[row][col].addObservation(
+                requiredVe
+            )
+
+            errorSum[row][col] +=
+                sample.afr - sample.targetAfr
+
             errorCount[row][col]++
         }
 
-        // --- Step 2: Proposed value per cell → clamp via authority limits → percent ---
-        val authorityLimits = AutoTuneAuthorityLimits(
-            maxCellPercentageChange = (config.authority.toDouble() * 100.0)
-        )
+        /*
+         * --------------------------------------------------------------
+         * STEP 2
+         * Determine which cells actually have enough data.
+         * --------------------------------------------------------------
+         */
+        for (r in 0 until rows) {
+            for (c in 0 until cols) {
 
-        val rawAdjustments = MutableList(rows) { r ->
-            MutableList(cols) { c ->
-                val locked = (r to c) in lockedCells
-                val weight = ewma[r][c].totalWeight()
-
-                if (locked || weight < config.minCellSamples) {
-                    0.0
-                } else {
-                    val beginningValue = currentTableValues[r][c]
-                    val proposed = ewma[r][c].proposedValue(beginningValue)
-                    val clamped = authorityLimits.clamp(proposed, beginningValue)
-                    if (beginningValue != 0.0) (clamped - beginningValue) / beginningValue * 100.0 else 0.0
-                }
+                eligible[r][c] =
+                    !(r to c in lockedCells) &&
+                    ewma[r][c].totalWeight() >=
+                    config.minCellSamples
             }
         }
 
-        // --- Step 3: Smoothing passes ---
+        /*
+         * --------------------------------------------------------------
+         * STEP 3
+         * EWMA proposal.
+         *
+         * IMPORTANT:
+         * No authority clamp yet.
+         *
+         * This allows smoothing to operate on the actual proposal field.
+         * Authority is enforced only after smoothing.
+         * --------------------------------------------------------------
+         */
+        val proposedAdjustments =
+            MutableList(rows) { r ->
+                MutableList(cols) { c ->
+
+                    if (!eligible[r][c]) {
+                        0.0
+                    } else {
+
+                        val beginningValue =
+                            currentTableValues[r][c]
+
+                        val proposedValue =
+                            ewma[r][c]
+                                .proposedValue(beginningValue)
+
+                        if (
+                            !proposedValue.isFinite() ||
+                            beginningValue == 0.0
+                        ) {
+                            0.0
+                        } else {
+                            (
+                                proposedValue -
+                                    beginningValue
+                                ) /
+                                beginningValue *
+                                100.0
+                        }
+                    }
+                }
+            }
+
+        /*
+         * --------------------------------------------------------------
+         * STEP 4
+         * Smoothing.
+         *
+         * Smoothing is deliberately performed BEFORE authority clamping.
+         *
+         * Unlike the previous implementation, smoothing cannot create
+         * changes in cells that have no valid data.
+         * --------------------------------------------------------------
+         */
         if (config.smoothingPasses > 0) {
-            smooth(rawAdjustments, config.smoothingPasses)
+            smooth(
+                adjustments = proposedAdjustments,
+                eligible = eligible,
+                passes = config.smoothingPasses
+            )
         }
 
-        // --- Step 4: Build heat map & aggregate stats ---
-        val heatMap = mutableListOf<MutableList<AutoTuneCellInfo>>()
+        /*
+         * --------------------------------------------------------------
+         * STEP 5
+         * Authority clamp AFTER smoothing.
+         * --------------------------------------------------------------
+         */
+        val authorityLimits =
+            AutoTuneAuthorityLimits(
+                maxCellPercentageChange =
+                    config.authority.toDouble() * 100.0
+            )
+
+        val finalAdjustments =
+            MutableList(rows) { r ->
+                MutableList(cols) { c ->
+
+                    /*
+                     * Locked and data-insufficient cells are immutable.
+                     */
+                    if (!eligible[r][c]) {
+                        0.0
+                    } else {
+
+                        val beginningValue =
+                            currentTableValues[r][c]
+
+                        val smoothedPercent =
+                            proposedAdjustments[r][c]
+
+                        if (
+                            !smoothedPercent.isFinite() ||
+                            beginningValue == 0.0
+                        ) {
+                            0.0
+                        } else {
+
+                            /*
+                             * Convert the smoothed percentage back to a
+                             * proposed absolute VE value.
+                             */
+                            val proposedValue =
+                                beginningValue *
+                                    (
+                                        1.0 +
+                                            smoothedPercent / 100.0
+                                        )
+
+                            if (!proposedValue.isFinite()) {
+                                0.0
+                            } else {
+
+                                /*
+                                 * Apply:
+                                 *
+                                 * 1. absolute delta
+                                 * 2. percentage authority
+                                 * 3. absolute rails
+                                 */
+                                val clampedValue =
+                                    authorityLimits.clamp(
+                                        proposedValue,
+                                        beginningValue
+                                    )
+
+                                if (
+                                    !clampedValue.isFinite()
+                                ) {
+                                    0.0
+                                } else {
+                                    (
+                                        clampedValue -
+                                            beginningValue
+                                        ) /
+                                        beginningValue *
+                                        100.0
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+        /*
+         * --------------------------------------------------------------
+         * STEP 6
+         * Heatmap and aggregate statistics.
+         * --------------------------------------------------------------
+         */
+        val heatMap =
+            MutableList(rows) {
+                mutableListOf<AutoTuneCellInfo>()
+            }
+
         var totalAdjustments = 0
         var lockedCellCount = 0
 
         for (r in 0 until rows) {
-            val rowList = mutableListOf<AutoTuneCellInfo>()
+
             for (c in 0 until cols) {
-                val locked = (r to c) in lockedCells
-                val count = errorCount[r][c]
-                val avgError = if (count > 0) errorSum[r][c] / count else 0.0
-                val adj = rawAdjustments[r][c]
 
-                if (locked) lockedCellCount++
-                if (adj != 0.0) totalAdjustments++
+                val locked =
+                    (r to c) in lockedCells
 
-                rowList.add(
+                val count =
+                    errorCount[r][c]
+
+                val avgError =
+                    if (count > 0) {
+                        errorSum[r][c] /
+                            count.toDouble()
+                    } else {
+                        0.0
+                    }
+
+                val adjustment =
+                    finalAdjustments[r][c]
+
+                if (locked) {
+                    lockedCellCount++
+                }
+
+                if (
+                    adjustment.isFinite() &&
+                    abs(adjustment) > 1e-9
+                ) {
+                    totalAdjustments++
+                }
+
+                heatMap[r].add(
                     AutoTuneCellInfo(
                         row = r,
                         col = c,
                         sampleCount = count,
                         averageError = avgError,
-                        totalAdjustment = adj,
+                        totalAdjustment = adjustment,
                         isLocked = locked
                     )
                 )
             }
-            heatMap.add(rowList)
         }
 
-        // Cache for [getHeatMap].
-        cachedHeatMap = buildMap {
-            for (r in 0 until rows) {
-                for (c in 0 until cols) {
-                    put(r to c, heatMap[r][c])
+        cachedHeatMap =
+            buildMap {
+                for (r in 0 until rows) {
+                    for (c in 0 until cols) {
+                        put(
+                            r to c,
+                            heatMap[r][c]
+                        )
+                    }
                 }
             }
-        }
 
         return AutoTuneResult(
-            adjustments = rawAdjustments.map { it.toList() },
-            heatMap = heatMap.map { it.toList() },
-            totalAdjustments = totalAdjustments,
-            lockedCellCount = lockedCellCount,
-            rejectedSampleCounts = rejectCounts.toMap()
+            adjustments =
+                finalAdjustments.map {
+                    it.toList()
+                },
+            heatMap =
+                heatMap.map {
+                    it.toList()
+                },
+            totalAdjustments =
+                totalAdjustments,
+            lockedCellCount =
+                lockedCellCount,
+            rejectedSampleCounts =
+                rejectCounts.toMap()
         )
     }
 
     /**
-     * Clear all accumulated sample data.
+     * Clear all accumulated samples.
      *
-     * Does **not** clear locked cells; use [setCellLocked] individually
-     * or create a new engine instance for that.
+     * Locked cells are intentionally preserved.
      */
     fun clearData() {
         processedSamples.clear()
@@ -343,157 +614,442 @@ class AutoTuneEngine(private val config: AutoTuneConfig) {
     }
 
     /**
-     * Return the heat map from the most recent [computeAdjustments] call.
-     *
-     * If no computation has been performed yet, returns an empty map.
+     * Return the last computed heatmap.
      */
-    fun getHeatMap(): Map<Pair<Int, Int>, AutoTuneCellInfo> = cachedHeatMap
+    fun getHeatMap():
+        Map<Pair<Int, Int>, AutoTuneCellInfo> =
+        cachedHeatMap
 
     /**
-     * Lock or unlock a single cell.
-     *
-     * Locked cells are excluded from autotune adjustments and act as anchors
-     * during smoothing (they always contribute 0.0 to their neighbours'
-     * weighted average, causing adjustments to taper toward locked regions).
-     *
-     * @param row Row index of the cell.
-     * @param col Column index of the cell.
-     * @param locked `true` to lock, `false` to unlock.
+     * Lock or unlock a cell.
      */
-    fun setCellLocked(row: Int, col: Int, locked: Boolean) {
+    fun setCellLocked(
+        row: Int,
+        col: Int,
+        locked: Boolean
+    ) {
         val key = row to col
-        if (locked) lockedCells.add(key) else lockedCells.remove(key)
+
+        if (locked) {
+            lockedCells.add(key)
+        } else {
+            lockedCells.remove(key)
+        }
     }
 
     /**
-     * Check whether a specific cell is currently locked.
+     * Check whether a cell is locked.
      */
-    fun isCellLocked(row: Int, col: Int): Boolean = (row to col) in lockedCells
+    fun isCellLocked(
+        row: Int,
+        col: Int
+    ): Boolean =
+        (row to col) in lockedCells
 
-    /** Return the current number of accumulated (accepted, un-binned) samples. */
-    fun sampleCount(): Int = processedSamples.size
+    /**
+     * Number of accepted, delay-matched samples waiting for computation.
+     */
+    fun sampleCount(): Int =
+        processedSamples.size
 
-    /** Return counts of raw samples rejected so far, keyed by reason. */
-    fun rejectedSampleCounts(): Map<AutoTuneRejectReason, Int> = rejectCounts.toMap()
+    /**
+     * Return rejected sample counters.
+     */
+    fun rejectedSampleCounts():
+        Map<AutoTuneRejectReason, Int> =
+        rejectCounts.toMap()
+
+    // ------------------------------------------------------------------
+    // Validation
+    // ------------------------------------------------------------------
+
+    private fun validateConfiguration() {
+
+        require(config.authority.isFinite()) {
+            "AutoTune authority must be finite."
+        }
+
+        require(config.authority in 0.0f..1.0f) {
+            "AutoTune authority must be between 0.0 and 1.0."
+        }
+
+        require(config.minCellSamples > 0) {
+            "AutoTune minCellSamples must be greater than zero."
+        }
+
+        require(config.smoothingPasses >= 0) {
+            "AutoTune smoothingPasses cannot be negative."
+        }
+
+        require(config.lambdaDelayMs.isFinite()) {
+            "AutoTune lambdaDelayMs must be finite."
+        }
+
+        require(config.lambdaDelayMs >= 0.0) {
+            "AutoTune lambdaDelayMs cannot be negative."
+        }
+    }
+
+    private fun validateTableAndAxes(
+        table: List<List<Double>>,
+        rpmBins: List<Double>,
+        loadBins: List<Double>
+    ) {
+
+        require(table.isNotEmpty()) {
+            "AutoTune VE table must not be empty."
+        }
+
+        val cols =
+            table.firstOrNull()?.size ?: 0
+
+        require(cols > 0) {
+            "AutoTune VE table must have at least one column."
+        }
+
+        /*
+         * Every row must have exactly the same number of columns.
+         */
+        table.forEachIndexed { rowIndex, row ->
+
+            require(row.size == cols) {
+                "AutoTune VE table is not rectangular: " +
+                    "row $rowIndex has ${row.size} columns, " +
+                    "expected $cols."
+            }
+
+            row.forEachIndexed { colIndex, value ->
+
+                require(value.isFinite()) {
+                    "AutoTune VE table contains a non-finite " +
+                        "value at row=$rowIndex col=$colIndex."
+                }
+            }
+        }
+
+        require(rpmBins.size == cols) {
+            "RPM axis size ${rpmBins.size} does not match " +
+                "table column count $cols."
+        }
+
+        require(loadBins.size == table.size) {
+            "Load axis size ${loadBins.size} does not match " +
+                "table row count ${table.size}."
+        }
+
+        validateAxis(
+            name = "RPM",
+            bins = rpmBins
+        )
+
+        validateAxis(
+            name = "Load",
+            bins = loadBins
+        )
+    }
+
+    private fun validateAxis(
+        name: String,
+        bins: List<Double>
+    ) {
+
+        require(bins.isNotEmpty()) {
+            "$name axis must not be empty."
+        }
+
+        bins.forEachIndexed { index, value ->
+
+            require(value.isFinite()) {
+                "$name axis contains a non-finite value at index $index."
+            }
+        }
+
+        for (i in 1 until bins.size) {
+
+            require(bins[i] > bins[i - 1]) {
+                "$name axis must be strictly ascending: " +
+                    "bins[$i - 1]=${bins[i - 1]} " +
+                    "must be < bins[$i]=${bins[i]}."
+            }
+        }
+    }
 
     // ------------------------------------------------------------------
     // Smoothing
     // ------------------------------------------------------------------
 
     /**
-     * Apply [passes] iterations of 3×3 weighted-average smoothing **in-place**.
+     * Smooth only cells that have sufficient valid data.
      *
-     * The kernel is a discrete Gaussian approximation:
-     * ```
-     *  1  2  1
-     *  2  4  2      (total weight = 16)
-     *  1  2  1
-     * ```
+     * Unsampled cells are NOT allowed to acquire an adjustment simply
+     * because they are next to an active cell.
      *
-     * Edge cells use whatever neighbours are available (reduced kernel).
-     * Locked cells are pinned to 0.0 after every pass so they act as anchors.
+     * Locked cells participate as zero-value anchors.
      */
     private fun smooth(
         adjustments: MutableList<MutableList<Double>>,
+        eligible: Array<BooleanArray>,
         passes: Int
     ) {
+
         val rows = adjustments.size
-        val cols = if (rows > 0) adjustments[0].size else 0
-        if (rows == 0 || cols == 0) return
 
-        val lockedSet = lockedCells
+        if (rows == 0) return
 
-        // Pre-allocated kernel: (deltaRow, deltaCol, weight)
-        val kernel = arrayOf(
-            intArrayOf(-1, -1), intArrayOf(0, -1), intArrayOf(1, -1),
-            intArrayOf(-1,  0), intArrayOf(0,  0), intArrayOf(1,  0),
-            intArrayOf(-1,  1), intArrayOf(0,  1), intArrayOf(1,  1)
-        )
-        val weights = doubleArrayOf(1.0, 2.0, 1.0, 2.0, 4.0, 2.0, 1.0, 2.0, 1.0)
+        val cols = adjustments[0].size
+
+        if (cols == 0) return
+
+        val kernel =
+            arrayOf(
+                intArrayOf(-1, -1),
+                intArrayOf(0, -1),
+                intArrayOf(1, -1),
+
+                intArrayOf(-1, 0),
+                intArrayOf(0, 0),
+                intArrayOf(1, 0),
+
+                intArrayOf(-1, 1),
+                intArrayOf(0, 1),
+                intArrayOf(1, 1)
+            )
+
+        val weights =
+            doubleArrayOf(
+                1.0, 2.0, 1.0,
+                2.0, 4.0, 2.0,
+                1.0, 2.0, 1.0
+            )
 
         repeat(passes) {
-            // Snapshot current state so each pass reads from the previous.
-            val src = Array(rows) { r -> DoubleArray(cols) { adjustments[r][it] } }
+
+            val source =
+                Array(rows) { r ->
+                    DoubleArray(cols) { c ->
+                        adjustments[r][c]
+                    }
+                }
 
             for (r in 0 until rows) {
+
                 for (c in 0 until cols) {
-                    if ((r to c) in lockedSet) {
+
+                    /*
+                     * Locked cells are permanently zero.
+                     */
+                    if ((r to c) in lockedCells) {
                         adjustments[r][c] = 0.0
                         continue
                     }
 
-                    var wSum = 0.0
-                    var wTotal = 0.0
-                    for (k in kernel.indices) {
-                        val nr = r + kernel[k][0]
-                        val nc = c + kernel[k][1]
-                        if (nr in 0 until rows && nc in 0 until cols) {
-                            wSum += src[nr][nc] * weights[k]
-                            wTotal += weights[k]
-                        }
+                    /*
+                     * Unsampled cells remain zero.
+                     */
+                    if (!eligible[r][c]) {
+                        adjustments[r][c] = 0.0
+                        continue
                     }
-                    adjustments[r][c] = if (wTotal > 0.0) wSum / wTotal else 0.0
+
+                    var weightedSum = 0.0
+                    var totalWeight = 0.0
+
+                    for (k in kernel.indices) {
+
+                        val nr =
+                            r + kernel[k][0]
+
+                        val nc =
+                            c + kernel[k][1]
+
+                        if (
+                            nr !in 0 until rows ||
+                            nc !in 0 until cols
+                        ) {
+                            continue
+                        }
+
+                        /*
+                         * Only valid/eligible cells and locked anchors
+                         * participate in smoothing.
+                         */
+                        val neighbourEligible =
+                            eligible[nr][nc]
+
+                        val neighbourLocked =
+                            (nr to nc) in lockedCells
+
+                        if (
+                            !neighbourEligible &&
+                            !neighbourLocked
+                        ) {
+                            continue
+                        }
+
+                        val value =
+                            source[nr][nc]
+
+                        if (!value.isFinite()) {
+                            continue
+                        }
+
+                        weightedSum +=
+                            value * weights[k]
+
+                        totalWeight +=
+                            weights[k]
+                    }
+
+                    adjustments[r][c] =
+                        if (totalWeight > 0.0) {
+                            weightedSum / totalWeight
+                        } else {
+                            source[r][c]
+                        }
                 }
             }
         }
     }
 
     // ------------------------------------------------------------------
-    // Internal helpers
+    // Binning
     // ------------------------------------------------------------------
 
     /**
-     * Find the nearest-neighbour bin index for [value] in a sorted [bins] list.
+     * Find the nearest axis bin.
      *
-     * Uses binary search to locate the insertion point, then picks the closer
-     * of the two adjacent bins. Returns -1 if [bins] is empty.
+     * IMPORTANT:
+     * Values outside [firstBin, lastBin] return -1.
+     *
+     * They are never clamped to the nearest edge cell.
      */
-    private fun binIndex(value: Double, bins: List<Double>): Int {
-        val n = bins.size
-        if (n == 0) return -1
-        if (n == 1) return 0
+    private fun binIndex(
+        value: Double,
+        bins: List<Double>
+    ): Int {
 
-        // Binary search for the first element >= value.
-        var lo = 0
-        var hi = n - 1
-        while (lo < hi) {
-            val mid = lo + (hi - lo) / 2
-            if (bins[mid] < value) lo = mid + 1 else hi = mid
+        if (!value.isFinite()) {
+            return -1
         }
 
-        // lo is the index of the first bin >= value (or the last bin if value
-        // exceeds all).  Pick the closer of lo and lo-1.
-        val prev = if (lo > 0) lo - 1 else lo
-        return if (abs(value - bins[lo]) <= abs(value - bins[prev])) lo else prev
-    }
+        if (bins.isEmpty()) {
+            return -1
+        }
 
-    /** Produce a zero-adjustment result with an empty heat map. */
-    private fun zeroResult(table: List<List<Double>>): AutoTuneResult {
-        val heatMap = table.mapIndexed { r, row ->
-            row.mapIndexed { c, _ ->
-                AutoTuneCellInfo(
-                    row = r, col = c,
-                    sampleCount = 0,
-                    averageError = 0.0,
-                    totalAdjustment = 0.0,
-                    isLocked = (r to c) in lockedCells
-                )
+        if (value < bins.first()) {
+            return -1
+        }
+
+        if (value > bins.last()) {
+            return -1
+        }
+
+        if (bins.size == 1) {
+            return 0
+        }
+
+        var low = 0
+        var high = bins.lastIndex
+
+        while (low < high) {
+
+            val mid =
+                low + (high - low) / 2
+
+            if (bins[mid] < value) {
+                low = mid + 1
+            } else {
+                high = mid
             }
         }
+
+        /*
+         * low is the first bin >= value.
+         */
+        val upperIndex = low
+
+        if (upperIndex == 0) {
+            return 0
+        }
+
+        val lowerIndex =
+            upperIndex - 1
+
+        val lowerDistance =
+            abs(
+                value -
+                    bins[lowerIndex]
+            )
+
+        val upperDistance =
+            abs(
+                bins[upperIndex] -
+                    value
+            )
+
+        return if (
+            upperDistance < lowerDistance
+        ) {
+            upperIndex
+        } else {
+            lowerIndex
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Zero result
+    // ------------------------------------------------------------------
+
+    /**
+     * Produce a safe zero-adjustment result.
+     *
+     * Locked cells are counted correctly.
+     */
+    private fun zeroResult(
+        table: List<List<Double>>
+    ): AutoTuneResult {
+
+        val heatMap =
+            table.mapIndexed { r, row ->
+
+                row.mapIndexed { c, _ ->
+
+                    AutoTuneCellInfo(
+                        row = r,
+                        col = c,
+                        sampleCount = 0,
+                        averageError = 0.0,
+                        totalAdjustment = 0.0,
+                        isLocked =
+                            (r to c) in lockedCells
+                    )
+                }
+            }
+
+        val lockedCount =
+            heatMap.sumOf { row ->
+                row.count { it.isLocked }
+            }
+
         return AutoTuneResult(
-            adjustments = table.map { row -> row.map { 0.0 } },
-            heatMap = heatMap,
+            adjustments =
+                table.map { row ->
+                    row.map { 0.0 }
+                },
+            heatMap =
+                heatMap,
             totalAdjustments = 0,
-            lockedCellCount = 0,
-            rejectedSampleCounts = rejectCounts.toMap()
+            lockedCellCount =
+                lockedCount,
+            rejectedSampleCounts =
+                rejectCounts.toMap()
         )
     }
 
     // ------------------------------------------------------------------
-    // Internal data types
+    // Internal data
     // ------------------------------------------------------------------
 
-    /** A sample that passed filtering + lambda-delay matching, ready to bin. */
     private data class ProcessedSample(
         val rpm: Double,
         val load: Double,

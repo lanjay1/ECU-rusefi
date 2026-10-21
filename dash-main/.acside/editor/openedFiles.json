@@ -1,20 +1,35 @@
 {
   "allFiles": [
     {
-      "file": "/storage/emulated/0/ztunkt/dash-main/app/src/main/java/com/ztune/libretune/core/protocol/ZtuneProtocol.kt",
+      "file": "/storage/emulated/0/ztunkt/dash-main/app/src/main/java/com/ztune/libretune/core/autotune/AutoTuneEngine.kt",
+      "selection": {
+        "end": {
+          "column": 17,
+          "index": 28327,
+          "line": 1035
+        },
+        "start": {
+          "column": 17,
+          "index": 28327,
+          "line": 1035
+        }
+      }
+    },
+    {
+      "file": "/storage/emulated/0/ztunkt/dash-main/app/src/main/java/com/ztune/libretune/core/autotune/AutoTuneLogic.kt",
       "selection": {
         "end": {
           "column": 1,
-          "index": 8404,
-          "line": 242
+          "index": 16052,
+          "line": 620
         },
         "start": {
           "column": 1,
-          "index": 8404,
-          "line": 242
+          "index": 16052,
+          "line": 620
         }
       }
     }
   ],
-  "selectedFile": "/storage/emulated/0/ztunkt/dash-main/app/src/main/java/com/ztune/libretune/core/protocol/ZtuneProtocol.kt"
+  "selectedFile": "/storage/emulated/0/ztunkt/dash-main/app/src/main/java/com/ztune/libretune/core/autotune/AutoTuneEngine.kt"
 }

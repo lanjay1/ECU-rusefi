@@ -107,56 +107,126 @@ class AutoTuneController {
      * @param channelValues Map of channel name → current value.
      */
     fun feedSample(channelValues: Map<String, Double>) {
-        val eng = engine ?: return
-        val cfg = cachedConfig ?: return
+    val eng = engine ?: return
+    val cfg = cachedConfig ?: return
 
-        val rpm = channelValues[cfg.rpmChannelName] ?: return
-        val load = channelValues[cfg.loadChannelName] ?: return
-        val measuredAfr = channelValues[cfg.afrChannelName] ?: return
+    /*
+     * Required channels
+     *
+     * Jangan menggunakan fallback numerik untuk channel sensor.
+     * Nilai seperti 999°C atau 0%/s dapat membuat sample yang sebenarnya
+     * tidak lengkap lolos filter AutoTune.
+     */
+    val rpm = channelValues[cfg.rpmChannelName] ?: return
+    val load = channelValues[cfg.loadChannelName] ?: return
+    val measuredAfr = channelValues[cfg.afrChannelName] ?: return
 
-        // Look up target AFR. Try several conventional names.
-        val targetAfr = channelValues[cfg.targetAfrChannelName]
-            ?: channelValues["afrTarget"]
-            ?: channelValues["targetAfr"]
-            ?: channelValues["target_afr"]
-            ?: channelValues["lambdaTarget"]
-            ?: channelValues[cfg.targetAfrTableName.ifEmpty { "afrTarget" }]
-            ?: return
+    /*
+     * Target AFR wajib tersedia.
+     */
+    val targetAfr = channelValues[cfg.targetAfrChannelName]
+        ?: channelValues["afrTarget"]
+        ?: channelValues["targetAfr"]
+        ?: channelValues["target_afr"]
+        ?: channelValues["lambdaTarget"]
+        ?: channelValues[cfg.targetAfrTableName.ifEmpty { "afrTarget" }]
+        ?: return
 
-        val clt = channelValues[cfg.cltChannelName] ?: 999.0
-        val tps = channelValues[cfg.tpsChannelName] ?: 0.0
-        val tpsRate = channelValues[cfg.tpsRateChannelName] ?: 0.0
-
-        eng.addSample(
-            AutoTuneSample(
-                rpm = rpm,
-                load = load,
-                afr = measuredAfr,
-                targetAfr = targetAfr,
-                ve = 0.0,
-                clt = clt,
-                tps = tps,
-                tpsRate = tpsRate,
-                // TODO(firmware): ztune.ini punya tidak ada channel eksplisit
-                // untuk fuel-cut/DFCO atau accel-enrichment aktif. Sampai ada,
-                // dua filter ini secara efektif tidak pernah menolak sample
-                // (selalu false) — filter RPM/load/CLT/TPS-rate/AFR-railed
-                // tetap jalan penuh.
-                accelEnrichActive = false,
-                fuelCutActive = false
-            )
-        )
-
-        _state.update { prev ->
-            val newCount = eng.sampleCount().toLong()
-            if (newCount != prev.sampleCount) {
-                prev.copy(sampleCount = newCount)
-            } else {
-                prev
-            }
-        }
+    /*
+     * CLT diperlukan apabila filter temperatur aktif.
+     *
+     * Jika CLT tidak tersedia, sample harus dibuang.
+     * Jangan menggantinya dengan 999°C.
+     */
+    val clt = if (cfg.filters.minClt.isFinite()) {
+        channelValues[cfg.cltChannelName] ?: return
+    } else {
+        channelValues[cfg.cltChannelName] ?: Double.NaN
     }
 
+    /*
+     * TPS rate diperlukan apabila transient filter aktif.
+     *
+     * Jika channel tidak tersedia, sample tidak boleh dianggap steady
+     * hanya karena fallback 0.0.
+     */
+    val tpsRate = if (cfg.filters.maxTpsRate.isFinite()) {
+        channelValues[cfg.tpsRateChannelName] ?: return
+    } else {
+        channelValues[cfg.tpsRateChannelName] ?: Double.NaN
+    }
+
+    /*
+     * TPS sendiri saat ini belum digunakan oleh classifySample().
+     * Karena itu tidak dipaksa sebagai required channel.
+     *
+     * Jika nanti filter TPS absolut ditambahkan, bagian ini harus
+     * diubah menjadi required channel juga.
+     */
+    val tps = channelValues[cfg.tpsChannelName] ?: 0.0
+
+    /*
+     * Pastikan nilai numerik utama benar-benar finite.
+     *
+     * NaN dan Infinity tidak boleh masuk ke AutoTune karena dapat
+     * merusak perhitungan EWMA, binning, dan hasil adjustment.
+     */
+    if (
+        !rpm.isFinite() ||
+        !load.isFinite() ||
+        !measuredAfr.isFinite() ||
+        !targetAfr.isFinite() ||
+        !clt.isFinite() ||
+        !tpsRate.isFinite() ||
+        !tps.isFinite()
+    ) {
+        return
+    }
+
+    /*
+     * Target AFR harus masuk akal.
+     *
+     * classifySample() memiliki batas sensor AFR, tetapi target AFR
+     * bukan sensor AFR. Nilai <= 0 akan membuat perhitungan
+     * required VE tidak valid.
+     */
+    if (targetAfr <= 0.0) {
+        return
+    }
+
+    eng.addSample(
+        AutoTuneSample(
+            rpm = rpm,
+            load = load,
+            afr = measuredAfr,
+            targetAfr = targetAfr,
+            ve = 0.0,
+            clt = clt,
+            tps = tps,
+            tpsRate = tpsRate,
+
+            /*
+             * Belum ada channel realtime yang dipakai untuk membaca
+             * status accel enrichment / fuel cut.
+             *
+             * Jangan mengarang status TRUE/FALSE dari nilai sensor yang
+             * tidak ada. Ini masih menjadi pekerjaan audit berikutnya.
+             */
+            accelEnrichActive = false,
+            fuelCutActive = false
+        )
+    )
+
+    _state.update { prev ->
+        val newCount = eng.sampleCount().toLong()
+
+        if (newCount != prev.sampleCount) {
+            prev.copy(sampleCount = newCount)
+        } else {
+            prev
+        }
+    }
+}
     /**
      * Stop the autotune session and compute final adjustments.
      *
